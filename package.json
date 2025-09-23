@@ -1,0 +1,19 @@
+{
+  "name": "x-posting-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.56.0",
+    "twitter-api-v2": "^1.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "typescript": "^5.5.4"
+  }
+}
