@@ -33,11 +33,11 @@ const {
   ACTIVE_HOURS_END,
   TIMEZONE = "Europe/Athens",
 
-  // === NEW: Image posting controls ===
+  // Image posting controls
   ENABLE_IMAGE_POSTS = "false",   // "true" to enable image cycles
   IMAGE_FREQUENCY = "3",          // every Nth cycle uses an image (1 = every cycle)
   IMAGE_SIZE = "1024x1024",       // 256x256 | 512x512 | 1024x1024
-  IMAGE_STYLE = "high-contrast, clean composition" // appended to image prompt
+  IMAGE_STYLE = "high-contrast, clean composition"
 } = process.env;
 
 // ----- guards -----
@@ -60,7 +60,7 @@ const twitter = new TwitterApi({
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY!,
-  baseURL: OPENAI_BASE_URL
+  baseURL: OPENAI_BASE_URL // leave undefined for native OpenAI; set for OpenRouter-compatible
 });
 
 // ----- config -----
@@ -124,7 +124,7 @@ async function generateTweet(): Promise<string> {
   return trimTweet(resp.choices?.[0]?.message?.content ?? "", maxLen);
 }
 
-// ----- NEW: caption → image prompt + alt text -----
+// ----- caption → image prompt + alt text -----
 async function buildImagePromptFromCaption(caption: string): Promise<string> {
   try {
     const sys =
@@ -182,26 +182,44 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
   return "Abstract visual aligned with caption: DAO cash-flow flywheel motif with metallic accents on a dark minimalist background.";
 }
 
-// ----- FIXED: safe image generation -----
+// ----- FIXED: image generation (no response_format; b64 + URL fallback) -----
 async function generateImage(prompt: string): Promise<string> {
   const res = await openai.images.generate({
     model: "gpt-image-1",
     prompt,
-    size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024",
-    response_format: "b64_json"
+    size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
+    // don't pass response_format; some deployments reject it
   });
 
-  const data = res?.data;
-  if (!data || data.length === 0 || !data[0]?.b64_json) {
-    throw new Error("Image generation failed: empty response from OpenAI Images API");
+  const data = (res as any)?.data as Array<any> | undefined;
+  if (!data || data.length === 0) {
+    throw new Error("Image generation failed: empty response from Images API");
   }
 
-  const b64 = data[0].b64_json;
-  const bytes = Buffer.from(b64, "base64");
-  const filename = `image_${Date.now()}.png`;
-  const filePath = path.join("/tmp", filename);
-  fs.writeFileSync(filePath, bytes);
-  return filePath;
+  // Prefer base64 if available
+  const b64 = data[0]?.b64_json as string | undefined;
+  if (b64) {
+    const bytes = Buffer.from(b64, "base64");
+    const filename = `image_${Date.now()}.png`;
+    const filePath = path.join("/tmp", filename);
+    fs.writeFileSync(filePath, bytes);
+    return filePath;
+  }
+
+  // Fallback to URL
+  const url = data[0]?.url as string | undefined;
+  if (url) {
+    // Node 18+ has global fetch
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Failed to download image: ${resp.status} ${resp.statusText}`);
+    const arrayBuf = await resp.arrayBuffer();
+    const filename = `image_${Date.now()}.png`;
+    const filePath = path.join("/tmp", filename);
+    fs.writeFileSync(filePath, Buffer.from(arrayBuf));
+    return filePath;
+  }
+
+  throw new Error("Image generation failed: neither b64_json nor url in response");
 }
 
 // ----- posting -----
