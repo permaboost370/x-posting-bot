@@ -60,7 +60,7 @@ const twitter = new TwitterApi({
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY!,
-  baseURL: OPENAI_BASE_URL // leave undefined for native OpenAI; set for OpenRouter-compatible
+  baseURL: OPENAI_BASE_URL
 });
 
 // ----- config -----
@@ -152,7 +152,6 @@ async function buildImagePromptFromCaption(caption: string): Promise<string> {
     console.warn("LLM image-prompt build failed, using heuristic:", e);
   }
 
-  // Heuristic fallback
   const core = caption
     .replace(/[#@"'`_*~]/g, "")
     .split(/\s+/)
@@ -183,16 +182,21 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
   return "Abstract visual aligned with caption: DAO cash-flow flywheel motif with metallic accents on a dark minimalist background.";
 }
 
-// ----- NEW: image generation + posting -----
+// ----- FIXED: safe image generation -----
 async function generateImage(prompt: string): Promise<string> {
-  const img = await openai.images.generate({
+  const res = await openai.images.generate({
     model: "gpt-image-1",
     prompt,
     size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024",
     response_format: "b64_json"
   });
 
-  const b64 = img.data[0].b64_json!;
+  const data = res?.data;
+  if (!data || data.length === 0 || !data[0]?.b64_json) {
+    throw new Error("Image generation failed: empty response from OpenAI Images API");
+  }
+
+  const b64 = data[0].b64_json;
   const bytes = Buffer.from(b64, "base64");
   const filename = `image_${Date.now()}.png`;
   const filePath = path.join("/tmp", filename);
@@ -200,6 +204,7 @@ async function generateImage(prompt: string): Promise<string> {
   return filePath;
 }
 
+// ----- posting -----
 async function postTweet(text: string) {
   if (dryRun) {
     console.log("[DRY RUN] Would post TEXT:\n" + text);
@@ -215,7 +220,6 @@ async function postImageTweet(imagePath: string, text: string, altText?: string)
     console.log("[DRY RUN] Caption:", text);
     return;
   }
-  // Upload media (v1.1), then tweet (v2)
   const mediaId = await twitter.v1.uploadMedia(imagePath);
   if (altText && altText.trim()) {
     try {
