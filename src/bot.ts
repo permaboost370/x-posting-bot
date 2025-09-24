@@ -35,10 +35,10 @@ const {
   MEMORY_FILE = "/tmp/post_memory.json",
   MEMORY_MAX_POSTS = "500",
   MEMORY_TTL_DAYS = "14",
-  SIMILARITY_THRESHOLD = "0.5",
-  TOPIC_COOLDOWN_MINUTES = "240",
-  MAX_REGEN_TRIES = "3",
-  SKIP_ON_DUPLICATE = "true",
+  SIMILARITY_THRESHOLD = "0.5",           // token Jaccard, 0..1 (higher = stricter)
+  TOPIC_COOLDOWN_MINUTES = "240",         // avoid same topic for N minutes
+  MAX_REGEN_TRIES = "3",                  // tries to regenerate novel caption
+  SKIP_ON_DUPLICATE = "true",             // skip cycle if still dup after retries
 
   // --- Image prompt steering ---
   IMAGE_PROMPT_OVERRIDE,
@@ -491,7 +491,7 @@ async function generateReplyForTweet(sourceText: string, authorHandle?: string):
   return trimmed.length >= replyMinLen ? trimmed : "";
 }
 
-// ----- main loop -----
+// ----- main posting loop -----
 async function waitForActiveWindow() {
   if (withinActiveHours()) return;
   const ms = msUntilActiveStart();
@@ -501,15 +501,15 @@ async function waitForActiveWindow() {
 
 async function ensureNovelCaption(): Promise<string | null> {
   let lastDraft = "";
-  for (let attempt = 1; attempt <= Math.max(1, parseInt(MAX_REGEN_TRIES!,10)); attempt++) {
+  for (let attempt = 1; attempt <= maxRegen; attempt++) {
     const draft = await generateTweet();
     lastDraft = draft;
     const dup = isDuplicateText(draft);
     const hot = isTopicCooling(draft);
     if (!dup && !hot) return draft;
-    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${MAX_REGEN_TRIES}`);
+    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${maxRegen}`);
   }
-  if (/^true$/i.test(SKIP_ON_DUPLICATE!)) {
+  if (skipOnDup) {
     console.log("Caption remained duplicate after retries; skipping this cycle.");
     return null;
   }
@@ -575,7 +575,6 @@ async function discoverySniperLoop() {
         const q = discoveryQueries[Math.floor(Math.random() * discoveryQueries.length)];
         const lookbackIso = new Date(Date.now() - discoveryLookbackMinutes * 60000).toISOString();
 
-        // Bias to English, no RT/replies; we also filter top-level later
         const query = `${q} lang:en -is:retweet`;
 
         const res = await twitter.v2.search(query, {
@@ -589,46 +588,56 @@ async function discoverySniperLoop() {
         const incUsers = (res as any)?.includes?.users as any[] | undefined;
         if (incUsers) for (const u of incUsers) users.set(u.id, u);
 
-        const tweets = res.data?.data ?? [];
+        const tweets = (res.data?.data ?? []) as any[];
+
         const sinceMs = Date.now() - discoveryLookbackMinutes * 60000;
-        const candidates = tweets.filter(t => {
+        const candidates = tweets.filter((t: any) => {
           const fresh = t.created_at && new Date(t.created_at).getTime() >= sinceMs && t.created_at >= lookbackIso;
+
+          // keep only top-level (not replies/RTs)
           const isTopLevel = !(t.referenced_tweets && t.referenced_tweets.some((r: any) => r.type !== "replied_to"));
-          const pm = t.public_metrics || {};
-          const author = users.get(t.author_id);
+
+          const pm: any = t.public_metrics || {};
+          const author = users.get(t.author_id as string);
           if (!author) return false;
+
           const followers = author.public_metrics?.followers_count ?? 0;
           const verified = !!author.verified;
 
           const fameOK = followers >= discoveryMinFollowers && (!discoveryRequireVerified || verified);
           const popOK = (pm.retweet_count ?? 0) >= discoveryMinRetweets;
 
-          const cooldownOK = !recentlyRepliedTo(t.author_id, recentAuthorCooldownMin);
+          const authorId = t.author_id as string | undefined;
+          if (!authorId) return false;
+
+          const cooldownOK = !recentlyRepliedTo(authorId, recentAuthorCooldownMin);
 
           return fresh && isTopLevel && fameOK && popOK && cooldownOK;
         });
 
         if (candidates.length > 0) {
-          // Select up to N random candidates this run
           const shuffled = candidates.sort(() => Math.random() - 0.5).slice(0, discoveryMaxPerRun);
           for (const t of shuffled) {
             if (repliesToday >= replyDailyCap) break;
 
-            const author = users.get(t.author_id);
-            const handle = author?.username as string | undefined;
+            const authorId = t.author_id as string | undefined;
+            const tweetId = t.id as string | undefined;
+            if (!authorId || !tweetId) continue;
 
-            const replyText = await generateReplyForTweet(t.text, handle);
+            const author = users.get(authorId);
+            const handle = (author?.username as string | undefined) || "user";
+
+            const replyText = await generateReplyForTweet(String(t.text || ""), handle);
             if (!replyText) continue;
 
             if (dryRun) {
-              console.log(`[DRY RUN] Discovery reply to @${handle} (${t.id}):\n${replyText}`);
+              console.log(`[DRY RUN] Discovery reply to @${handle} (${tweetId}):\n${replyText}`);
             } else {
-              const posted = await twitter.v2.reply(replyText, t.id);
-              console.log("Discovery replied to", handle, "tweetId:", t.id, "→", posted.data?.id);
+              const posted = await twitter.v2.reply(replyText, tweetId as string);
+              console.log("Discovery replied to", handle, "tweetId:", tweetId, "→", posted.data?.id);
             }
             repliesToday += 1;
-            recordAuthorReplied(t.author_id);
-            // small human-ish pause if multiple
+            recordAuthorReplied(authorId);
             await new Promise(r => setTimeout(r, 5000 + Math.floor(Math.random() * 10000)));
           }
         } else {
