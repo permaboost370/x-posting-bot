@@ -369,7 +369,7 @@ async function generateImageFromPromptOrReference(derivedPrompt: string): Promis
   if (refPath) {
     const params: any = { model: "gpt-image-1", prompt: finalPrompt, image: fs.createReadStream(refPath), size: IMAGE_SIZE as any };
     if (maskPath) params.mask = fs.createReadStream(maskPath);
-    const res = await (openai as any).images.edits(params);
+    const res = await openai.images.edit(params);
     const data = (res as any)?.data as Array<any> | undefined;
     if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
     const b64 = data[0]?.b64_json as string | undefined;
