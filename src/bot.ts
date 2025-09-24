@@ -8,6 +8,9 @@ import OpenAI from "openai";
 import { buildTweetPrompt } from "./prompt.js";
 import character from "./character.js";
 
+/* =========================
+   ENV
+========================= */
 const {
   // X / Twitter
   X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET,
@@ -28,7 +31,18 @@ const {
   ENABLE_IMAGE_POSTS = "false",   // "true" to enable image cycles
   IMAGE_FREQUENCY = "3",          // every Nth cycle uses an image (1 = every cycle)
   IMAGE_SIZE = "1024x1024",       // 256x256 | 512x512 | 1024x1024
-  IMAGE_STYLE = "high-contrast, clean composition",
+  IMAGE_STYLE = "high-contrast, clean composition, cinematic lighting",
+
+  // --- Image prompt steering (NEW) ---
+  IMAGE_PROMPT_MODE = "hybrid",           // text | hybrid | persona
+  IMAGE_PROMPT_PERSONA_WEIGHT = "0.25",   // 0..1
+  IMAGE_PROMPT_MAX_TOKENS = "120",
+
+  // --- Optional reference image (edits mode)
+  IMAGE_REF_URL,
+  IMAGE_REF_PATH,
+  IMAGE_MASK_URL,
+  IMAGE_MASK_PATH,
 
   // --- Memory & Dedupe ---
   MEMORY_ENABLED = "true",
@@ -39,17 +53,6 @@ const {
   TOPIC_COOLDOWN_MINUTES = "240",         // avoid same topic for N minutes
   MAX_REGEN_TRIES = "3",                  // tries to regenerate novel caption
   SKIP_ON_DUPLICATE = "true",             // skip cycle if still dup after retries
-
-  // --- Image prompt steering ---
-  IMAGE_PROMPT_OVERRIDE,
-  IMAGE_PROMPT_PREFIX = "",
-  IMAGE_PROMPT_SUFFIX = "",
-
-  // --- Optional reference image (edits mode)
-  IMAGE_REF_URL,
-  IMAGE_REF_PATH,
-  IMAGE_MASK_URL,
-  IMAGE_MASK_PATH,
 
   // --- Discovery Sniper (auto replies)
   ENABLE_DISCOVERY_SNIPER = "true",
@@ -70,7 +73,9 @@ const {
   REPLY_MAX_LEN = "280"
 } = process.env;
 
-// ----- guards -----
+/* =========================
+   Guards
+========================= */
 function need(name: string, val?: string) { if (!val) throw new Error(`Missing env ${name}`); }
 need("X_API_KEY", X_API_KEY);
 need("X_API_SECRET", X_API_SECRET);
@@ -78,7 +83,9 @@ need("X_ACCESS_TOKEN", X_ACCESS_TOKEN);
 need("X_ACCESS_SECRET", X_ACCESS_SECRET);
 need("OPENAI_API_KEY", OPENAI_API_KEY);
 
-// ----- clients -----
+/* =========================
+   Clients
+========================= */
 const twitter = new TwitterApi({
   appKey: X_API_KEY!, appSecret: X_API_SECRET!,
   accessToken: X_ACCESS_TOKEN!, accessSecret: X_ACCESS_SECRET!
@@ -89,7 +96,9 @@ const openai = new OpenAI({
   baseURL: OPENAI_BASE_URL // leave undefined for native OpenAI; set for OpenRouter-compatible
 });
 
-// ----- config -----
+/* =========================
+   Config
+========================= */
 const minMin = Math.max(5, parseInt(POST_INTERVAL_MIN!, 10));
 const maxMin = Math.max(minMin, parseInt(POST_INTERVAL_MAX!, 10));
 const postImmediately = /^true$/i.test(POST_IMMEDIATELY!);
@@ -99,7 +108,7 @@ const dryRun = /^true$/i.test(DRY_RUN!);
 const enableImagePosts = /^true$/i.test(ENABLE_IMAGE_POSTS!);
 const imageEvery = Math.max(1, parseInt(IMAGE_FREQUENCY!, 10));
 
-// Discovery sniper config
+/* ===== Discovery Sniper config ===== */
 const enableDiscoverySniper = /^true$/i.test(ENABLE_DISCOVERY_SNIPER!);
 const discoveryQueries = DISCOVERY_QUERIES.split(",").map(s => s.trim()).filter(Boolean);
 const discoveryMinFollowers = Math.max(0, parseInt(DISCOVERY_MIN_FOLLOWERS!, 10));
@@ -112,7 +121,7 @@ const discoveryProb = Math.min(1, Math.max(0, parseFloat(DISCOVERY_PROBABILITY!)
 const discoveryMaxPerRun = Math.max(1, parseInt(DISCOVERY_MAX_PER_RUN!, 10));
 const recentAuthorCooldownMin = Math.max(0, parseInt(RECENT_AUTHOR_COOLDOWN_MINUTES!, 10));
 
-// Replies caps
+/* ===== Replies caps ===== */
 const replyDailyCap = Math.max(0, parseInt(REPLY_DAILY_CAP!, 10));
 const replyMinLen = Math.max(1, parseInt(REPLY_MIN_LEN!, 10));
 const replyMaxLen = Math.min(280, Math.max(60, parseInt(REPLY_MAX_LEN!, 10)));
@@ -124,7 +133,9 @@ function resetDailyIfNeeded() {
   if (d !== repliesDayStamp) { repliesDayStamp = d; repliesToday = 0; }
 }
 
-// ----- helpers: time / intervals -----
+/* =========================
+   Time helpers
+========================= */
 function withinActiveHours(): boolean {
   if (!ACTIVE_HOURS_START || !ACTIVE_HOURS_END) return true;
   try {
@@ -154,7 +165,9 @@ function randRangeMs(minM: number, maxM: number) {
   return mins * 60 * 1000;
 }
 
-// ----- helpers: text gen -----
+/* =========================
+   Text generation
+========================= */
 function trimTweet(s: string, limit: number) {
   const t = s.trim().replace(/^"|"$/g, "");
   if (t.length <= limit) return t;
@@ -179,43 +192,87 @@ async function generateTweet(): Promise<string> {
   return trimTweet(resp.choices?.[0]?.message?.content ?? "", maxLen);
 }
 
-// ----- caption → image prompt + alt text -----
+/* =========================
+   Image prompt (caption-first)  — NEW
+========================= */
 async function buildImagePromptFromCaption(caption: string): Promise<string> {
+  const MODE = (IMAGE_PROMPT_MODE || "hybrid").toLowerCase(); // text | hybrid | persona
+  const PERSONA_W = Math.max(0, Math.min(1, parseFloat(IMAGE_PROMPT_PERSONA_WEIGHT || "0.25")));
+  const MAX_TOK = Math.max(60, Math.min(300, parseInt(IMAGE_PROMPT_MAX_TOKENS || "120", 10)));
+
+  const safeCap = caption.replace(/\s+/g, " ").trim();
+  const baseSystem =
+    "You write concise prompts for an image generator.\n" +
+    "- Output 1–3 short lines, no more.\n" +
+    "- Describe concrete subjects, setting, mood, lighting, camera.\n" +
+    "- NO text overlays, logos, watermarks, or brand names.\n" +
+    "- Keep it visually grounded; avoid abstract token-talk.\n";
+
+  const personaCue =
+    "tone: minimalist, clean composition; cinematic lighting; subtle metallic accents; dark background optional.";
+
+  const userCaptionOnly =
+    `Caption:\n${safeCap}\n\n` +
+    "Task: Convert the caption into a concrete visual scene.\n" +
+    "Return ONLY the visual prompt (no extra commentary).";
+
+  const userHybrid =
+    `Caption:\n${safeCap}\n\n` +
+    `Style cues (optional, light): ${personaCue}\n` +
+    "Task: Convert the caption into a concrete visual scene, optionally seasoning with the style cues.\n" +
+    "Return ONLY the visual prompt.";
+
   try {
-    const sys =
-      "You craft concise prompts for an image generator. 1–3 lines. " +
-      "No text overlays or logos. High-contrast, clean composition. " +
-      "Describe objects/scene/lighting/camera if relevant.";
-    const user =
-      `Caption:\n${caption}\n\nPersona cues: DAO/ledger/flywheel, metallic accents, minimalist dark background, cinematic rim light.\n` +
-      `Return ONLY the prompt.`;
+    const useHybrid = MODE === "hybrid" || MODE === "persona";
+    const sys = baseSystem;
+    const usr = useHybrid ? userHybrid : userCaptionOnly;
 
     const resp = await openai.chat.completions.create({
       model: OPENAI_MODEL || "gpt-4o-mini",
       temperature: 0.6,
-      max_tokens: 120,
+      max_tokens: MAX_TOK,
       messages: [
         { role: "system", content: sys },
-        { role: "user", content: user }
+        { role: "user", content: usr }
       ]
     });
-    const out = resp.choices?.[0]?.message?.content?.trim();
-    if (out && out.length > 10) {
-      return `${out}\nStyle: ${IMAGE_STYLE}`;
-    }
-  } catch (e) {
-    console.warn("LLM image-prompt build failed, using heuristic:", e);
-  }
 
-  const core = caption
-    .replace(/[#@"'`_*~]/g, "")
-    .split(/\s+/)
-    .filter(w => w.length > 2 && /^[a-zA-Z\-]+$/.test(w))
-    .slice(0, 10)
-    .join(" ");
-  return `Minimalist, high-contrast concept art inspired by: ${core}. Metallic accents, dark background, soft rim lighting, clean composition, no text, no logos. Style: ${IMAGE_STYLE}`;
+    let prompt = resp.choices?.[0]?.message?.content?.trim() || "";
+
+    if (MODE === "persona" && PERSONA_W > 0) {
+      prompt = [
+        prompt,
+        PERSONA_W >= 0.66
+          ? "look: high-contrast, cinematic; subtle metallic accents; dark minimalist set; no text"
+          : "look: clean composition; cinematic lighting; no text"
+      ].join("\n");
+    }
+
+    if (prompt.length < 20) throw new Error("Prompt too short");
+
+    // Keep your general style suffix (not DAO content)
+    return `${prompt}\nStyle: ${IMAGE_STYLE}`;
+  } catch (e) {
+    console.warn("LLM image-prompt build failed, falling back to heuristic:", e);
+    const base = safeCap
+      .replace(/https?:\/\/\S+/g, "")
+      .replace(/[#"*@`_~]/g, "")
+      .trim();
+
+    const parts = [
+      `Visual inspired by: ${base}.`,
+      "Describe concrete subjects and environment; cinematic lighting; clean composition; no text, no logos."
+    ];
+    if (MODE !== "text" && parseFloat(IMAGE_PROMPT_PERSONA_WEIGHT || "0.25") > 0) {
+      parts.push("Subtle style: minimalist, high-contrast.");
+    }
+    return `${parts.join(" ")}\nStyle: ${IMAGE_STYLE}`;
+  }
 }
 
+/* =========================
+   ALT text
+========================= */
 async function buildAltTextFromCaption(caption: string, conceptHint?: string): Promise<string> {
   try {
     const sys = "Write concise, objective ALT text for an image (<= 250 chars). No hashtags or emojis.";
@@ -234,10 +291,39 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
   } catch (e) {
     console.warn("ALT text build failed, using default:", e);
   }
-  return "Abstract visual aligned with caption: DAO cash-flow flywheel motif with metallic accents on a dark minimalist background.";
+  return "Abstract visual aligned with caption; cinematic lighting; clean composition.";
 }
 
-// ----- FIXED: image generation (no response_format; b64 + URL fallback) -----
+/* =========================
+   Image gen (generate + edits)
+========================= */
+async function downloadToTmp(url: string, nameHint = "ref"): Promise<string> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
+  const bytes = Buffer.from(await resp.arrayBuffer());
+  const ext = (url.split(".").pop() || "png").split("?")[0];
+  const file = path.join("/tmp", `${nameHint}_${Date.now()}.${ext}`);
+  fs.writeFileSync(file, bytes);
+  return file;
+}
+function resolveMaybeRelative(p?: string) {
+  if (!p) return undefined as string | undefined;
+  return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+}
+async function resolveRefAndMask(): Promise<{ refPath?: string; maskPath?: string }> {
+  let refPath: string | undefined; let maskPath: string | undefined;
+  if (IMAGE_REF_URL) refPath = await downloadToTmp(IMAGE_REF_URL, "ref");
+  else if (IMAGE_REF_PATH) {
+    const rp = resolveMaybeRelative(IMAGE_REF_PATH);
+    if (rp && fs.existsSync(rp)) refPath = rp;
+  }
+  if (IMAGE_MASK_URL) maskPath = await downloadToTmp(IMAGE_MASK_URL, "mask");
+  else if (IMAGE_MASK_PATH) {
+    const mp = resolveMaybeRelative(IMAGE_MASK_PATH);
+    if (mp && fs.existsSync(mp)) maskPath = mp;
+  }
+  return { refPath, maskPath };
+}
 async function generateImage(prompt: string): Promise<string> {
   const res = await openai.images.generate({
     model: "gpt-image-1",
@@ -268,6 +354,54 @@ async function generateImage(prompt: string): Promise<string> {
     return filePath;
   }
   throw new Error("Image generation failed: neither b64_json nor url in response");
+}
+function buildFinalImagePrompt(derived: string): string {
+  const IMAGE_PROMPT_OVERRIDE = process.env.IMAGE_PROMPT_OVERRIDE;
+  const IMAGE_PROMPT_PREFIX = process.env.IMAGE_PROMPT_PREFIX || "";
+  const IMAGE_PROMPT_SUFFIX = process.env.IMAGE_PROMPT_SUFFIX || "";
+  if (IMAGE_PROMPT_OVERRIDE && IMAGE_PROMPT_OVERRIDE.trim()) return IMAGE_PROMPT_OVERRIDE.trim();
+  const parts = [IMAGE_PROMPT_PREFIX.trim(), derived.trim(), IMAGE_PROMPT_SUFFIX.trim()].filter(Boolean);
+  return parts.join("\n");
+}
+async function generateImageFromPromptOrReference(derivedPrompt: string): Promise<string> {
+  const finalPrompt = buildFinalImagePrompt(derivedPrompt);
+  const { refPath, maskPath } = await resolveRefAndMask();
+  if (refPath) {
+    const params: any = { model: "gpt-image-1", prompt: finalPrompt, image: fs.createReadStream(refPath), size: IMAGE_SIZE as any };
+    if (maskPath) params.mask = fs.createReadStream(maskPath);
+    const res = await (openai as any).images.edits(params);
+    const data = (res as any)?.data as Array<any> | undefined;
+    if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
+    const b64 = data[0]?.b64_json as string | undefined;
+    if (b64) { const file = path.join("/tmp", `edit_${Date.now()}.png`); fs.writeFileSync(file, Buffer.from(b64, "base64")); return file; }
+    const url = data[0]?.url as string | undefined;
+    if (url) {
+      const dl = await downloadToTmp(url, "edit");
+      return dl;
+    }
+    throw new Error("Image edit failed: neither b64_json nor url");
+  }
+  return await generateImage(finalPrompt);
+}
+
+/* =========================
+   Posting (text / image)
+========================= */
+async function postTweet(text: string) {
+  if (dryRun) { console.log("[DRY RUN] Would post TEXT:\n" + text); return { id: "dryrun" }; }
+  const res = await twitter.v2.tweet(text);
+  console.log("Posted tweet id:", res.data?.id);
+  return { id: res.data?.id as string | undefined };
+}
+async function postImageTweet(imagePath: string, text: string, altText?: string) {
+  if (dryRun) { console.log("[DRY RUN] Would post IMAGE:", imagePath); console.log("[DRY RUN] Caption:", text); return { id: "dryrun" }; }
+  const mediaId = await twitter.v1.uploadMedia(imagePath);
+  if (altText && altText.trim()) {
+    try { await twitter.v1.createMediaMetadata(mediaId, { alt_text: { text: altText.slice(0, 1000) } }); } catch (e) { console.warn("ALT text set failed (non-fatal):", e); }
+  }
+  const res = await twitter.v2.tweet({ text, media: { media_ids: [mediaId] } as any });
+  console.log("Posted image tweet id:", res.data?.id);
+  return { id: res.data?.id as string | undefined };
 }
 
 /* =========================
@@ -397,66 +531,9 @@ function recentlyRepliedTo(id: string, minutesCooldown: number) {
   return mem.authors.some(a => a.id === id && a.ts >= cutoff);
 }
 
-// ----- Image prompt steering / reference helpers -----
-function buildFinalImagePrompt(derived: string): string {
-  if (IMAGE_PROMPT_OVERRIDE && IMAGE_PROMPT_OVERRIDE.trim()) return IMAGE_PROMPT_OVERRIDE.trim();
-  const parts = [IMAGE_PROMPT_PREFIX.trim(), derived.trim(), IMAGE_PROMPT_SUFFIX.trim()].filter(Boolean);
-  return parts.join("\n");
-}
-async function downloadToTmp(url: string, nameHint = "ref"): Promise<string> {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
-  const bytes = Buffer.from(await resp.arrayBuffer());
-  const ext = (url.split(".").pop() || "png").split("?")[0];
-  const file = path.join("/tmp", `${nameHint}_${Date.now()}.${ext}`);
-  fs.writeFileSync(file, bytes);
-  return file;
-}
-async function resolveRefAndMask(): Promise<{ refPath?: string; maskPath?: string }> {
-  let refPath: string | undefined; let maskPath: string | undefined;
-  if (IMAGE_REF_URL) refPath = await downloadToTmp(IMAGE_REF_URL, "ref");
-  else if (IMAGE_REF_PATH && fs.existsSync(IMAGE_REF_PATH)) refPath = IMAGE_REF_PATH;
-  if (IMAGE_MASK_URL) maskPath = await downloadToTmp(IMAGE_MASK_URL, "mask");
-  else if (IMAGE_MASK_PATH && fs.existsSync(IMAGE_MASK_PATH)) maskPath = IMAGE_MASK_PATH;
-  return { refPath, maskPath };
-}
-async function generateImageFromPromptOrReference(derivedPrompt: string): Promise<string> {
-  const finalPrompt = buildFinalImagePrompt(derivedPrompt);
-  const { refPath, maskPath } = await resolveRefAndMask();
-  if (refPath) {
-    const params: any = { model: "gpt-image-1", prompt: finalPrompt, image: fs.createReadStream(refPath), size: IMAGE_SIZE as any };
-    if (maskPath) params.mask = fs.createReadStream(maskPath);
-    const res = await (openai as any).images.edits(params);
-    const data = (res as any)?.data as Array<any> | undefined;
-    if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
-    const b64 = data[0]?.b64_json as string | undefined;
-    if (b64) { const file = path.join("/tmp", `edit_${Date.now()}.png`); fs.writeFileSync(file, Buffer.from(b64, "base64")); return file; }
-    const url = data[0]?.url as string | undefined;
-    if (url) return await downloadToTmp(url, "edit");
-    throw new Error("Image edit failed: neither b64_json nor url");
-  }
-  return await generateImage(finalPrompt);
-}
-
-// ----- posting -----
-async function postTweet(text: string) {
-  if (dryRun) { console.log("[DRY RUN] Would post TEXT:\n" + text); return { id: "dryrun" }; }
-  const res = await twitter.v2.tweet(text);
-  console.log("Posted tweet id:", res.data?.id);
-  return { id: res.data?.id as string | undefined };
-}
-async function postImageTweet(imagePath: string, text: string, altText?: string) {
-  if (dryRun) { console.log("[DRY RUN] Would post IMAGE:", imagePath); console.log("[DRY RUN] Caption:", text); return { id: "dryrun" }; }
-  const mediaId = await twitter.v1.uploadMedia(imagePath);
-  if (altText && altText.trim()) {
-    try { await twitter.v1.createMediaMetadata(mediaId, { alt_text: { text: altText.slice(0, 1000) } }); } catch (e) { console.warn("ALT text set failed (non-fatal):", e); }
-  }
-  const res = await twitter.v2.tweet({ text, media: { media_ids: [mediaId] } as any });
-  console.log("Posted image tweet id:", res.data?.id);
-  return { id: res.data?.id as string | undefined };
-}
-
-// ----- replies: generation -----
+/* =========================
+   Replies: generation
+========================= */
 async function generateReplyForTweet(sourceText: string, authorHandle?: string): Promise<string> {
   const sys = [
     `${(character as any).name || "Dao-Man"} — reply mode:`,
@@ -491,7 +568,9 @@ async function generateReplyForTweet(sourceText: string, authorHandle?: string):
   return trimmed.length >= replyMinLen ? trimmed : "";
 }
 
-// ----- main posting loop -----
+/* =========================
+   Posting loop
+========================= */
 async function waitForActiveWindow() {
   if (withinActiveHours()) return;
   const ms = msUntilActiveStart();
@@ -579,7 +658,7 @@ async function discoverySniperLoop() {
 
         const res = await twitter.v2.search(query, {
           max_results: 50,
-          "tweet.fields": ["author_id","created_at","public_metrics","referenced_tweets","conversation_id"],
+          "tweet.fields": ["author_id","created_at","public_metrics","referenced_tweets","conversation_id","text"],
           expansions: ["author_id"],
           "user.fields": ["username","verified","public_metrics"]
         });
@@ -656,7 +735,9 @@ async function discoverySniperLoop() {
   }
 }
 
-// ----- bootstrap -----
+/* =========================
+   Bootstrap
+========================= */
 (async () => {
   if (postImmediately) {
     try {
