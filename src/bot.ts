@@ -2,6 +2,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { TwitterApi } from "twitter-api-v2";
 import OpenAI from "openai";
 import { buildTweetPrompt } from "./prompt.js";
@@ -37,7 +38,28 @@ const {
   ENABLE_IMAGE_POSTS = "false",   // "true" to enable image cycles
   IMAGE_FREQUENCY = "3",          // every Nth cycle uses an image (1 = every cycle)
   IMAGE_SIZE = "1024x1024",       // 256x256 | 512x512 | 1024x1024
-  IMAGE_STYLE = "high-contrast, clean composition"
+  IMAGE_STYLE = "high-contrast, clean composition",
+
+  // --- NEW: Memory & Dedupe ---
+  MEMORY_ENABLED = "true",
+  MEMORY_FILE = "/tmp/post_memory.json",
+  MEMORY_MAX_POSTS = "500",
+  MEMORY_TTL_DAYS = "14",
+  SIMILARITY_THRESHOLD = "0.5",           // token Jaccard, 0..1 (higher = stricter)
+  TOPIC_COOLDOWN_MINUTES = "240",         // avoid same topic for N minutes
+  MAX_REGEN_TRIES = "3",                  // tries to regenerate novel caption
+  SKIP_ON_DUPLICATE = "true",             // skip cycle if still dup after retries
+
+  // --- NEW: Image prompt steering ---
+  IMAGE_PROMPT_OVERRIDE,
+  IMAGE_PROMPT_PREFIX = "",
+  IMAGE_PROMPT_SUFFIX = "",
+
+  // --- NEW: Optional reference image (edits mode)
+  IMAGE_REF_URL,
+  IMAGE_REF_PATH,
+  IMAGE_MASK_URL,
+  IMAGE_MASK_PATH
 } = process.env;
 
 // ----- guards -----
@@ -222,21 +244,192 @@ async function generateImage(prompt: string): Promise<string> {
   throw new Error("Image generation failed: neither b64_json nor url in response");
 }
 
+/* =========================
+   NEW: Memory (one-file)
+========================= */
+const memoryOn = /^true$/i.test(MEMORY_ENABLED!);
+const memoryFile = MEMORY_FILE!;
+const maxMemPosts = Math.max(50, parseInt(MEMORY_MAX_POSTS!, 10));
+const memTtlDays = Math.max(1, parseInt(MEMORY_TTL_DAYS!, 10));
+const simThresh = Math.min(0.999, Math.max(0, parseFloat(SIMILARITY_THRESHOLD!)));
+const topicCooldownMs = Math.max(0, parseInt(TOPIC_COOLDOWN_MINUTES!, 10)) * 60 * 1000;
+const maxRegen = Math.max(1, parseInt(MAX_REGEN_TRIES!, 10));
+const skipOnDup = /^true$/i.test(SKIP_ON_DUPLICATE!);
+
+type PostRec = { hash: string; text: string; ts: number; topics: string[] };
+type ImgRec  = { hash: string; prompt: string; ts: number };
+type MemoryData = { posts: PostRec[]; images: ImgRec[]; lastPruned?: number };
+
+function now() { return Date.now(); }
+function days(n: number) { return n * 86400000; }
+function normalizeText(s: string) {
+  return s
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/@[a-z0-9_]+/gi, "")
+    .replace(/#[\p{L}\p{N}_-]+/gu, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function sha256(s: string) { return crypto.createHash("sha256").update(s).digest("hex"); }
+const STOP = new Set(["the","a","an","and","or","but","if","on","in","to","for","of","with","from","is","are","was","were","be","been","it","this","that","these","those","as","at","by","we","you","i","they","he","she","them","our","your","their"]);
+function tokens(s: string): string[] { return normalizeText(s).split(" ").filter(w => w && !STOP.has(w)); }
+function bigrams(ws: string[]) { const out:string[]=[]; for (let i=0;i<ws.length-1;i++) out.push(ws[i]+" "+ws[i+1]); return out; }
+function extractTopics(s: string): string[] {
+  const t = tokens(s); const uni = t.slice(0,6); const bi = bigrams(t).slice(0,4);
+  return [...new Set([...bi, ...uni])].slice(0,8);
+}
+function jaccard(a: Set<string>, b: Set<string>) {
+  const inter = [...a].filter(x => b.has(x)).length;
+  const uni = a.size + b.size - inter;
+  return uni === 0 ? 0 : inter / uni;
+}
+
+function loadMem(): MemoryData {
+  if (!memoryOn) return { posts: [], images: [] };
+  try {
+    if (fs.existsSync(memoryFile)) {
+      const d = JSON.parse(fs.readFileSync(memoryFile, "utf-8"));
+      return { posts: d.posts ?? [], images: d.images ?? [], lastPruned: d.lastPruned };
+    }
+  } catch {}
+  return { posts: [], images: [] };
+}
+function saveMem(m: MemoryData) {
+  if (!memoryOn) return;
+  try { fs.writeFileSync(memoryFile, JSON.stringify(m), "utf-8"); } catch {}
+}
+const mem: MemoryData = loadMem();
+
+function pruneMem(force=false) {
+  if (!memoryOn) return;
+  const t = now();
+  if (!force && mem.lastPruned && t - mem.lastPruned < 30*60000) return;
+  const cutoff = t - days(memTtlDays);
+  mem.posts = mem.posts.filter(p => p.ts >= cutoff).slice(-maxMemPosts);
+  mem.images = mem.images.filter(i => i.ts >= cutoff).slice(-maxMemPosts);
+  mem.lastPruned = t;
+  saveMem(mem);
+}
+pruneMem(true);
+
+function isDuplicateText(text: string): boolean {
+  const n = normalizeText(text);
+  const h = sha256(n);
+  if (mem.posts.some(p => p.hash === h)) return true;
+  const A = new Set(tokens(n));
+  for (const p of mem.posts) {
+    const B = new Set(tokens(p.text));
+    const sim = jaccard(A, B);
+    if (sim >= simThresh) return true;
+  }
+  return false;
+}
+function isTopicCooling(text: string): boolean {
+  if (!topicCooldownMs) return false;
+  const nowMs = now();
+  const topics = new Set(extractTopics(text));
+  for (const p of mem.posts) {
+    if (nowMs - p.ts > topicCooldownMs) continue;
+    if (p.topics.some(tp => topics.has(tp))) return true;
+  }
+  return false;
+}
+function rememberPost(text: string) {
+  if (!memoryOn) return;
+  const n = normalizeText(text);
+  mem.posts.push({ hash: sha256(n), text: n, ts: now(), topics: extractTopics(n) });
+  pruneMem(true); saveMem(mem);
+}
+function seenImagePrompt(prompt: string): boolean {
+  const n = normalizeText(prompt);
+  const h = sha256(n);
+  if (mem.images.some(i => i.hash === h)) return true;
+  const A = new Set(tokens(n));
+  for (const i of mem.images) {
+    const B = new Set(tokens(i.prompt));
+    const sim = jaccard(A, B);
+    if (sim >= Math.max(0.4, simThresh - 0.1)) return true;
+  }
+  return false;
+}
+function rememberImagePrompt(prompt: string) {
+  if (!memoryOn) return;
+  const n = normalizeText(prompt);
+  mem.images.push({ hash: sha256(n), prompt: n, ts: now() });
+  pruneMem(true); saveMem(mem);
+}
+
+// ----- Image prompt steering / reference helpers -----
+function buildFinalImagePrompt(derived: string): string {
+  if (IMAGE_PROMPT_OVERRIDE && IMAGE_PROMPT_OVERRIDE.trim()) return IMAGE_PROMPT_OVERRIDE.trim();
+  const parts = [IMAGE_PROMPT_PREFIX.trim(), derived.trim(), IMAGE_PROMPT_SUFFIX.trim()].filter(Boolean);
+  return parts.join("\n");
+}
+async function downloadToTmp(url: string, nameHint = "ref"): Promise<string> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
+  const bytes = Buffer.from(await resp.arrayBuffer());
+  const ext = (url.split(".").pop() || "png").split("?")[0];
+  const file = path.join("/tmp", `${nameHint}_${Date.now()}.${ext}`);
+  fs.writeFileSync(file, bytes);
+  return file;
+}
+async function resolveRefAndMask(): Promise<{ refPath?: string; maskPath?: string }> {
+  let refPath: string | undefined; let maskPath: string | undefined;
+  if (IMAGE_REF_URL) refPath = await downloadToTmp(IMAGE_REF_URL, "ref");
+  else if (IMAGE_REF_PATH && fs.existsSync(IMAGE_REF_PATH)) refPath = IMAGE_REF_PATH;
+  if (IMAGE_MASK_URL) maskPath = await downloadToTmp(IMAGE_MASK_URL, "mask");
+  else if (IMAGE_MASK_PATH && fs.existsSync(IMAGE_MASK_PATH)) maskPath = IMAGE_MASK_PATH;
+  return { refPath, maskPath };
+}
+async function generateImageFromPromptOrReference(derivedPrompt: string): Promise<string> {
+  const finalPrompt = buildFinalImagePrompt(derivedPrompt);
+  const { refPath, maskPath } = await resolveRefAndMask();
+  if (refPath) {
+    const params: any = {
+      model: "gpt-image-1",
+      prompt: finalPrompt,
+      image: fs.createReadStream(refPath),
+      size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
+    };
+    if (maskPath) params.mask = fs.createReadStream(maskPath);
+
+    const res = await (openai as any).images.edits(params);
+    const data = (res as any)?.data as Array<any> | undefined;
+    if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
+
+    const b64 = data[0]?.b64_json as string | undefined;
+    if (b64) {
+      const file = path.join("/tmp", `edit_${Date.now()}.png`);
+      fs.writeFileSync(file, Buffer.from(b64, "base64"));
+      return file;
+    }
+    const url = data[0]?.url as string | undefined;
+    if (url) return await downloadToTmp(url, "edit");
+    throw new Error("Image edit failed: neither b64_json nor url");
+  }
+  // Fallback: plain text→image
+  return await generateImage(finalPrompt);
+}
+
 // ----- posting -----
 async function postTweet(text: string) {
   if (dryRun) {
     console.log("[DRY RUN] Would post TEXT:\n" + text);
-    return;
+    return { id: "dryrun" };
   }
   const res = await twitter.v2.tweet(text);
   console.log("Posted tweet id:", res.data?.id);
+  return { id: res.data?.id as string | undefined };
 }
 
 async function postImageTweet(imagePath: string, text: string, altText?: string) {
   if (dryRun) {
     console.log("[DRY RUN] Would post IMAGE:", imagePath);
     console.log("[DRY RUN] Caption:", text);
-    return;
+    return { id: "dryrun" };
   }
   const mediaId = await twitter.v1.uploadMedia(imagePath);
   if (altText && altText.trim()) {
@@ -248,6 +441,7 @@ async function postImageTweet(imagePath: string, text: string, altText?: string)
   }
   const res = await twitter.v2.tweet({ text, media: { media_ids: [mediaId] } as any });
   console.log("Posted image tweet id:", res.data?.id);
+  return { id: res.data?.id as string | undefined };
 }
 
 // ----- main loop -----
@@ -258,6 +452,24 @@ async function waitForActiveWindow() {
   await new Promise(r => setTimeout(r, ms));
 }
 
+async function ensureNovelCaption(): Promise<string | null> {
+  let lastDraft = "";
+  for (let attempt = 1; attempt <= maxRegen; attempt++) {
+    const draft = await generateTweet();
+    lastDraft = draft;
+    const dup = isDuplicateText(draft);
+    const hot = isTopicCooling(draft);
+    if (!dup && !hot) return draft;
+    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${maxRegen}`);
+  }
+  if (skipOnDup) {
+    console.log("Caption remained duplicate after retries; skipping this cycle.");
+    return null;
+  }
+  console.log("Caption remained duplicate; posting anyway.");
+  return lastDraft;
+}
+
 async function loop() {
   let cycleCount = 0;
   while (true) {
@@ -265,22 +477,37 @@ async function loop() {
       await waitForActiveWindow();
 
       cycleCount += 1;
-      const caption = await generateTweet();
+      const caption = await ensureNovelCaption();
+      if (!caption) {
+        // Soft skip: wait a short time then continue
+        const short = Math.min(15, minMin) * 60 * 1000;
+        await new Promise(r => setTimeout(r, short));
+        continue;
+      }
 
       const shouldImage = enableImagePosts && (cycleCount % imageEvery === 0);
 
       if (shouldImage) {
-        const imagePrompt = await buildImagePromptFromCaption(caption);
-        const imgPath = await generateImage(imagePrompt);
-        const altText = await buildAltTextFromCaption(caption, imagePrompt);
+        let imagePrompt = await buildImagePromptFromCaption(caption);
+        // memory-aware image prompt
+        if (seenImagePrompt(imagePrompt)) {
+          imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
+        }
 
-        console.log("Image prompt:", imagePrompt);
+        const finalPrompt = buildFinalImagePrompt(imagePrompt);
+        const imgPath = await generateImageFromPromptOrReference(finalPrompt);
+        const altText = await buildAltTextFromCaption(caption, finalPrompt);
+
+        console.log("Image prompt:", finalPrompt);
         console.log("Generated image:", imgPath);
 
-        await postImageTweet(imgPath, caption, altText);
+        const { id } = await postImageTweet(imgPath, caption, altText);
+        rememberImagePrompt(finalPrompt);
+        rememberPost(caption);
       } else {
         console.log("Generated:", caption);
-        await postTweet(caption);
+        const { id } = await postTweet(caption);
+        rememberPost(caption);
       }
     } catch (e) {
       console.error("Cycle error:", e);
@@ -297,17 +524,26 @@ async function loop() {
   if (postImmediately) {
     try {
       await waitForActiveWindow();
-      const caption = await generateTweet();
+      const caption = await ensureNovelCaption();
 
-      if (enableImagePosts && imageEvery === 1) {
-        const imagePrompt = await buildImagePromptFromCaption(caption);
-        const imgPath = await generateImage(imagePrompt);
-        const altText = await buildAltTextFromCaption(caption, imagePrompt);
-        console.log("Image prompt (immediate):", imagePrompt);
-        await postImageTweet(imgPath, caption, altText);
-      } else {
-        console.log("Generated (immediate):", caption);
-        await postTweet(caption);
+      if (caption) {
+        if (enableImagePosts && imageEvery === 1) {
+          let imagePrompt = await buildImagePromptFromCaption(caption);
+          if (seenImagePrompt(imagePrompt)) {
+            imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
+          }
+          const finalPrompt = buildFinalImagePrompt(imagePrompt);
+          const imgPath = await generateImageFromPromptOrReference(finalPrompt);
+          const altText = await buildAltTextFromCaption(caption, finalPrompt);
+          console.log("Image prompt (immediate):", finalPrompt);
+          await postImageTweet(imgPath, caption, altText);
+          rememberImagePrompt(finalPrompt);
+          rememberPost(caption);
+        } else {
+          console.log("Generated (immediate):", caption);
+          await postTweet(caption);
+          rememberPost(caption);
+        }
       }
     } catch (e) {
       console.error("Immediate post failed:", e);
