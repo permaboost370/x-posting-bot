@@ -5,6 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { TwitterApi } from "twitter-api-v2";
 import OpenAI from "openai";
+import { fileFromPath } from "openai/uploads";
 import { buildTweetPrompt } from "./prompt.js";
 import character from "./character.js";
 
@@ -342,15 +343,30 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
 /* =========================
    File helpers (URL → /tmp) with correct extensions
 ========================= */
+function guessMimeByExt(p: string): string {
+  const x = p.toLowerCase();
+  if (x.endsWith(".jpg") || x.endsWith(".jpeg")) return "image/jpeg";
+  if (x.endsWith(".png")) return "image/png";
+  if (x.endsWith(".webp")) return "image/webp";
+  return "image/png"; // safe default
+}
+
 async function downloadToTmp(url: string, tag = "ref"): Promise<string> {
-  const resp = await fetch(url);
+  const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
   const arrayBuf = await resp.arrayBuffer();
 
-  // pick extension from URL, fallback to .png
+  // Choose extension by header first, then URL, default to .png
+  const ct = (resp.headers.get("content-type") || "").toLowerCase();
   let ext = ".png";
-  if (/\.(jpe?g)(\?|$)/i.test(url)) ext = ".jpg";
-  else if (/\.webp(\?|$)/i.test(url)) ext = ".webp";
+  if (ct.includes("image/jpeg")) ext = ".jpg";
+  else if (ct.includes("image/png")) ext = ".png";
+  else if (ct.includes("image/webp")) ext = ".webp";
+  else {
+    if (/\.(jpe?g)(\?|$)/i.test(url)) ext = ".jpg";
+    else if (/\.webp(\?|$)/i.test(url)) ext = ".webp";
+    else ext = ".png";
+  }
 
   const filePath = path.join("/tmp", `${tag}_${Date.now()}${ext}`);
   fs.writeFileSync(filePath, Buffer.from(arrayBuf));
@@ -429,17 +445,24 @@ async function generateImageFromPromptOrReference(derivedPrompt: string): Promis
   const finalPrompt = buildFinalImagePrompt(derivedPrompt);
   const { refPath, maskPath } = await resolveRefAndMask();
 
-  if (refPath) {
-    const params: any = {
-      model: "gpt-image-1",
-      prompt: finalPrompt,
-      image: fs.createReadStream(refPath),
-      size: IMAGE_SIZE as any
-    };
-    if (maskPath) params.mask = fs.createReadStream(maskPath);
+  // If no reference, do a normal generate.
+  if (!refPath) {
+    return await generateImage(finalPrompt);
+  }
+
+  try {
+    // Build File objects with explicit types so the API never sees octet-stream
+    const imageFile = await fileFromPath(refPath, { type: guessMimeByExt(refPath) });
+    const maskFile = maskPath ? await fileFromPath(maskPath, { type: "image/png" }) : undefined;
 
     const res = await withLlmRetry("images.edit", () =>
-      openai.images.edit(params) // v4 SDK: .edit (singular)
+      openai.images.edit({
+        model: "gpt-image-1",
+        prompt: finalPrompt,
+        image: imageFile,
+        ...(maskFile ? { mask: maskFile } : {}),
+        size: IMAGE_SIZE as any
+      })
     );
 
     const data = (res as any)?.data as Array<any> | undefined;
@@ -455,9 +478,10 @@ async function generateImageFromPromptOrReference(derivedPrompt: string): Promis
     if (url) return await downloadToTmp(url, "edit");
 
     throw new Error("Image edit failed: neither b64_json nor url");
+  } catch (e) {
+    console.warn("images.edit failed; falling back to images.generate:", e);
+    return await generateImage(finalPrompt);
   }
-
-  return await generateImage(finalPrompt);
 }
 
 /* =========================
