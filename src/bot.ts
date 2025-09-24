@@ -33,18 +33,18 @@ const {
   IMAGE_SIZE = "1024x1024",       // 256x256 | 512x512 | 1024x1024
   IMAGE_STYLE = "high-contrast, clean composition, cinematic lighting",
 
-  // --- Image prompt steering (NEW) ---
+  // Image prompt steering
   IMAGE_PROMPT_MODE = "hybrid",           // text | hybrid | persona
   IMAGE_PROMPT_PERSONA_WEIGHT = "0.25",   // 0..1
   IMAGE_PROMPT_MAX_TOKENS = "120",
 
-  // --- Optional reference image (edits mode)
+  // Reference image (edits)
   IMAGE_REF_URL,
   IMAGE_REF_PATH,
   IMAGE_MASK_URL,
   IMAGE_MASK_PATH,
 
-  // --- Memory & Dedupe ---
+  // Memory & Dedupe
   MEMORY_ENABLED = "true",
   MEMORY_FILE = "/tmp/post_memory.json",
   MEMORY_MAX_POSTS = "500",
@@ -54,7 +54,7 @@ const {
   MAX_REGEN_TRIES = "3",                  // tries to regenerate novel caption
   SKIP_ON_DUPLICATE = "true",             // skip cycle if still dup after retries
 
-  // --- Discovery Sniper (auto replies)
+  // Discovery Sniper (auto replies)
   ENABLE_DISCOVERY_SNIPER = "true",
   DISCOVERY_QUERIES = "crypto,dao,defi,memecoin,airdrops",
   DISCOVERY_MIN_FOLLOWERS = "300000",
@@ -70,7 +70,12 @@ const {
   // Reply caps / bounds
   REPLY_DAILY_CAP = "12",
   REPLY_MIN_LEN = "12",
-  REPLY_MAX_LEN = "280"
+  REPLY_MAX_LEN = "280",
+
+  // LLM retry / cool-off
+  LLM_RETRY_MAX = "4",
+  LLM_RETRY_BASE_MS = "1500",
+  LLM_ON_429_SLEEP_MIN = "60"
 } = process.env;
 
 /* =========================
@@ -126,13 +131,6 @@ const replyDailyCap = Math.max(0, parseInt(REPLY_DAILY_CAP!, 10));
 const replyMinLen = Math.max(1, parseInt(REPLY_MIN_LEN!, 10));
 const replyMaxLen = Math.min(280, Math.max(60, parseInt(REPLY_MAX_LEN!, 10)));
 
-let repliesToday = 0;
-let repliesDayStamp = new Date().toISOString().slice(0, 10);
-function resetDailyIfNeeded() {
-  const d = new Date().toISOString().slice(0, 10);
-  if (d !== repliesDayStamp) { repliesDayStamp = d; repliesToday = 0; }
-}
-
 /* =========================
    Time helpers
 ========================= */
@@ -166,6 +164,48 @@ function randRangeMs(minM: number, maxM: number) {
 }
 
 /* =========================
+   LLM resilience (retry + 429 cool-off)
+========================= */
+const LLM_RETRY_MAX_N = Math.max(0, parseInt(LLM_RETRY_MAX!, 10));
+const LLM_RETRY_BASE = Math.max(250, parseInt(LLM_RETRY_BASE_MS!, 10));
+const LLM_COOL_MIN = Math.max(5, parseInt(LLM_ON_429_SLEEP_MIN!, 10));
+let llmDisabledUntilMs = 0;
+
+function jitter(ms: number) { return Math.floor(ms * (0.75 + Math.random() * 0.5)); }
+async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+async function withLlmRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  if (Date.now() < llmDisabledUntilMs) {
+    const mins = Math.ceil((llmDisabledUntilMs - Date.now()) / 60000);
+    throw new Error(`[LLM disabled ${mins}m] ${label} skipped due to previous 429`);
+  }
+  let lastErr: any = null;
+  for (let i = 0; i <= LLM_RETRY_MAX_N; i++) {
+    try { return await fn(); }
+    catch (e: any) {
+      lastErr = e;
+      const code = e?.code || e?.error?.code;
+      const status = e?.status;
+      const type = e?.error?.type;
+
+      if (code === "insufficient_quota" || status === 429 || type === "rate_limit_exceeded") {
+        llmDisabledUntilMs = Date.now() + LLM_COOL_MIN * 60000;
+        console.error(`[${label}] 429/quota — cooling off for ${LLM_COOL_MIN} minutes.`);
+        throw e;
+      }
+      if (status >= 500 || status === 408 || code === "ETIMEDOUT" || code === "ECONNRESET") {
+        const delay = jitter(LLM_RETRY_BASE * Math.pow(2, i));
+        console.warn(`[${label}] transient error; retry ${i+1}/${LLM_RETRY_MAX_N} in ${Math.round(delay/1000)}s`);
+        await sleep(delay);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+/* =========================
    Text generation
 ========================= */
 function trimTweet(s: string, limit: number) {
@@ -183,17 +223,19 @@ async function generateTweet(): Promise<string> {
   ];
   if (fewshot) messages.push({ role: "user", content: fewshot });
 
-  const resp = await openai.chat.completions.create({
-    model: OPENAI_MODEL!,
-    messages,
-    temperature: 0.8,
-    max_tokens: 200
-  });
+  const resp = await withLlmRetry("chat.generateTweet", () =>
+    openai.chat.completions.create({
+      model: OPENAI_MODEL!,
+      messages,
+      temperature: 0.8,
+      max_tokens: 200
+    })
+  );
   return trimTweet(resp.choices?.[0]?.message?.content ?? "", maxLen);
 }
 
 /* =========================
-   Image prompt (caption-first)  — NEW
+   Image prompt (caption-first)
 ========================= */
 async function buildImagePromptFromCaption(caption: string): Promise<string> {
   const MODE = (IMAGE_PROMPT_MODE || "hybrid").toLowerCase(); // text | hybrid | persona
@@ -227,15 +269,17 @@ async function buildImagePromptFromCaption(caption: string): Promise<string> {
     const sys = baseSystem;
     const usr = useHybrid ? userHybrid : userCaptionOnly;
 
-    const resp = await openai.chat.completions.create({
-      model: OPENAI_MODEL || "gpt-4o-mini",
-      temperature: 0.6,
-      max_tokens: MAX_TOK,
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: usr }
-      ]
-    });
+    const resp = await withLlmRetry("chat.buildImagePrompt", () =>
+      openai.chat.completions.create({
+        model: OPENAI_MODEL || "gpt-4o-mini",
+        temperature: 0.6,
+        max_tokens: MAX_TOK,
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: usr }
+        ]
+      })
+    );
 
     let prompt = resp.choices?.[0]?.message?.content?.trim() || "";
 
@@ -250,7 +294,6 @@ async function buildImagePromptFromCaption(caption: string): Promise<string> {
 
     if (prompt.length < 20) throw new Error("Prompt too short");
 
-    // Keep your general style suffix (not DAO content)
     return `${prompt}\nStyle: ${IMAGE_STYLE}`;
   } catch (e) {
     console.warn("LLM image-prompt build failed, falling back to heuristic:", e);
@@ -263,7 +306,7 @@ async function buildImagePromptFromCaption(caption: string): Promise<string> {
       `Visual inspired by: ${base}.`,
       "Describe concrete subjects and environment; cinematic lighting; clean composition; no text, no logos."
     ];
-    if (MODE !== "text" && parseFloat(IMAGE_PROMPT_PERSONA_WEIGHT || "0.25") > 0) {
+    if ((IMAGE_PROMPT_MODE || "hybrid") !== "text" && parseFloat(IMAGE_PROMPT_PERSONA_WEIGHT || "0.25") > 0) {
       parts.push("Subtle style: minimalist, high-contrast.");
     }
     return `${parts.join(" ")}\nStyle: ${IMAGE_STYLE}`;
@@ -277,15 +320,17 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
   try {
     const sys = "Write concise, objective ALT text for an image (<= 250 chars). No hashtags or emojis.";
     const user = `Caption: "${caption}"\nConcept hint: "${conceptHint || ""}"\nDescribe the likely image contents concisely.`;
-    const resp = await openai.chat.completions.create({
-      model: OPENAI_MODEL || "gpt-4o-mini",
-      temperature: 0.3,
-      max_tokens: 120,
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: user }
-      ]
-    });
+    const resp = await withLlmRetry("chat.altText", () =>
+      openai.chat.completions.create({
+        model: OPENAI_MODEL || "gpt-4o-mini",
+        temperature: 0.3,
+        max_tokens: 120,
+        messages: [
+          { role: "system", content: sys },
+          { role: "user", content: user }
+        ]
+      })
+    );
     const out = resp.choices?.[0]?.message?.content?.trim();
     if (out && out.length > 10) return out.slice(0, 240);
   } catch (e) {
@@ -295,63 +340,80 @@ async function buildAltTextFromCaption(caption: string, conceptHint?: string): P
 }
 
 /* =========================
-   Image gen (generate + edits)
+   File helpers (URL → /tmp) with correct extensions
 ========================= */
-async function downloadToTmp(url: string, nameHint = "ref"): Promise<string> {
+async function downloadToTmp(url: string, tag = "ref"): Promise<string> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
-  const bytes = Buffer.from(await resp.arrayBuffer());
-  const ext = (url.split(".").pop() || "png").split("?")[0];
-  const file = path.join("/tmp", `${nameHint}_${Date.now()}.${ext}`);
-  fs.writeFileSync(file, bytes);
-  return file;
+  const arrayBuf = await resp.arrayBuffer();
+
+  // pick extension from URL, fallback to .png
+  let ext = ".png";
+  if (/\.(jpe?g)(\?|$)/i.test(url)) ext = ".jpg";
+  else if (/\.webp(\?|$)/i.test(url)) ext = ".webp";
+
+  const filePath = path.join("/tmp", `${tag}_${Date.now()}${ext}`);
+  fs.writeFileSync(filePath, Buffer.from(arrayBuf));
+  return filePath;
 }
 function resolveMaybeRelative(p?: string) {
   if (!p) return undefined as string | undefined;
   return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
 }
 async function resolveRefAndMask(): Promise<{ refPath?: string; maskPath?: string }> {
-  let refPath: string | undefined; let maskPath: string | undefined;
-  if (IMAGE_REF_URL) refPath = await downloadToTmp(IMAGE_REF_URL, "ref");
-  else if (IMAGE_REF_PATH) {
-    const rp = resolveMaybeRelative(IMAGE_REF_PATH);
-    if (rp && fs.existsSync(rp)) refPath = rp;
+  let refPath: string | undefined; 
+  let maskPath: string | undefined;
+
+  try {
+    if (IMAGE_REF_URL) refPath = await downloadToTmp(IMAGE_REF_URL, "ref");
+    else if (IMAGE_REF_PATH) {
+      const rp = resolveMaybeRelative(IMAGE_REF_PATH);
+      if (rp && fs.existsSync(rp)) refPath = rp; else console.warn("IMAGE_REF_PATH not found:", rp);
+    }
+  } catch (e) {
+    console.warn("Reference image unavailable, falling back to generate:", e);
+    refPath = undefined;
   }
-  if (IMAGE_MASK_URL) maskPath = await downloadToTmp(IMAGE_MASK_URL, "mask");
-  else if (IMAGE_MASK_PATH) {
-    const mp = resolveMaybeRelative(IMAGE_MASK_PATH);
-    if (mp && fs.existsSync(mp)) maskPath = mp;
+
+  try {
+    if (IMAGE_MASK_URL) maskPath = await downloadToTmp(IMAGE_MASK_URL, "mask");
+    else if (IMAGE_MASK_PATH) {
+      const mp = resolveMaybeRelative(IMAGE_MASK_PATH);
+      if (mp && fs.existsSync(mp)) maskPath = mp; else console.warn("IMAGE_MASK_PATH not found:", mp);
+    }
+  } catch (e) {
+    console.warn("Mask image unavailable, continuing without mask:", e);
+    maskPath = undefined;
   }
+
   return { refPath, maskPath };
 }
+
+/* =========================
+   Images: generate OR edit (with reference)
+========================= */
 async function generateImage(prompt: string): Promise<string> {
-  const res = await openai.images.generate({
-    model: "gpt-image-1",
-    prompt,
-    size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
-  });
+  const res = await withLlmRetry("images.generate", () =>
+    openai.images.generate({
+      model: "gpt-image-1",
+      prompt,
+      size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
+    })
+  );
 
   const data = (res as any)?.data as Array<any> | undefined;
-  if (!data || data.length === 0) {
-    throw new Error("Image generation failed: empty response from Images API");
-  }
+  if (!data || data.length === 0) throw new Error("Image generation failed: empty response from Images API");
+
   const b64 = data[0]?.b64_json as string | undefined;
   if (b64) {
     const bytes = Buffer.from(b64, "base64");
-    const filename = `image_${Date.now()}.png`;
-    const filePath = path.join("/tmp", filename);
+    const filePath = path.join("/tmp", `image_${Date.now()}.png`);
     fs.writeFileSync(filePath, bytes);
     return filePath;
   }
   const url = data[0]?.url as string | undefined;
   if (url) {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`Failed to download image: ${resp.status} ${resp.statusText}`);
-    const arrayBuf = await resp.arrayBuffer();
-    const filename = `image_${Date.now()}.png`;
-    const filePath = path.join("/tmp", filename);
-    fs.writeFileSync(filePath, Buffer.from(arrayBuf));
-    return filePath;
+    return await downloadToTmp(url, "image");
   }
   throw new Error("Image generation failed: neither b64_json nor url in response");
 }
@@ -366,21 +428,35 @@ function buildFinalImagePrompt(derived: string): string {
 async function generateImageFromPromptOrReference(derivedPrompt: string): Promise<string> {
   const finalPrompt = buildFinalImagePrompt(derivedPrompt);
   const { refPath, maskPath } = await resolveRefAndMask();
+
   if (refPath) {
-    const params: any = { model: "gpt-image-1", prompt: finalPrompt, image: fs.createReadStream(refPath), size: IMAGE_SIZE as any };
+    const params: any = {
+      model: "gpt-image-1",
+      prompt: finalPrompt,
+      image: fs.createReadStream(refPath),
+      size: IMAGE_SIZE as any
+    };
     if (maskPath) params.mask = fs.createReadStream(maskPath);
-    const res = await openai.images.edit(params);
+
+    const res = await withLlmRetry("images.edit", () =>
+      openai.images.edit(params) // v4 SDK: .edit (singular)
+    );
+
     const data = (res as any)?.data as Array<any> | undefined;
     if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
+
     const b64 = data[0]?.b64_json as string | undefined;
-    if (b64) { const file = path.join("/tmp", `edit_${Date.now()}.png`); fs.writeFileSync(file, Buffer.from(b64, "base64")); return file; }
-    const url = data[0]?.url as string | undefined;
-    if (url) {
-      const dl = await downloadToTmp(url, "edit");
-      return dl;
+    if (b64) {
+      const file = path.join("/tmp", `edit_${Date.now()}.png`);
+      fs.writeFileSync(file, Buffer.from(b64, "base64"));
+      return file;
     }
+    const url = data[0]?.url as string | undefined;
+    if (url) return await downloadToTmp(url, "edit");
+
     throw new Error("Image edit failed: neither b64_json nor url");
   }
+
   return await generateImage(finalPrompt);
 }
 
@@ -553,15 +629,17 @@ async function generateReplyForTweet(sourceText: string, authorHandle?: string):
     "Write ONE reply in this voice. Return ONLY the reply text."
   ].join("\n");
 
-  const resp = await openai.chat.completions.create({
-    model: OPENAI_MODEL!,
-    temperature: 0.7,
-    max_tokens: 160,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: usr }
-    ]
-  });
+  const resp = await withLlmRetry("chat.generateReply", () =>
+    openai.chat.completions.create({
+      model: OPENAI_MODEL!,
+      temperature: 0.7,
+      max_tokens: 160,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: usr }
+      ]
+    })
+  );
 
   const text = resp.choices?.[0]?.message?.content?.trim() || "";
   const trimmed = trimTweet(text, replyMaxLen);
@@ -571,6 +649,13 @@ async function generateReplyForTweet(sourceText: string, authorHandle?: string):
 /* =========================
    Posting loop
 ========================= */
+let repliesToday = 0;
+let repliesDayStamp = new Date().toISOString().slice(0, 10);
+function resetDailyIfNeeded() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== repliesDayStamp) { repliesDayStamp = d; repliesToday = 0; }
+}
+
 async function waitForActiveWindow() {
   if (withinActiveHours()) return;
   const ms = msUntilActiveStart();
@@ -580,15 +665,15 @@ async function waitForActiveWindow() {
 
 async function ensureNovelCaption(): Promise<string | null> {
   let lastDraft = "";
-  for (let attempt = 1; attempt <= maxRegen; attempt++) {
+  for (let attempt = 1; attempt <= Math.max(1, parseInt(MAX_REGEN_TRIES!, 10)); attempt++) {
     const draft = await generateTweet();
     lastDraft = draft;
     const dup = isDuplicateText(draft);
     const hot = isTopicCooling(draft);
     if (!dup && !hot) return draft;
-    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${maxRegen}`);
+    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${MAX_REGEN_TRIES}`);
   }
-  if (skipOnDup) {
+  if (/^true$/i.test(SKIP_ON_DUPLICATE!)) {
     console.log("Caption remained duplicate after retries; skipping this cycle.");
     return null;
   }
@@ -600,11 +685,18 @@ async function postingLoop() {
   let cycleCount = 0;
   while (true) {
     try {
+      if (Date.now() < llmDisabledUntilMs) {
+        const mins = Math.ceil((llmDisabledUntilMs - Date.now()) / 60000);
+        console.log(`LLM cooling off; sleeping ${mins} minutes...`);
+        await sleep(Math.max(60000, llmDisabledUntilMs - Date.now()));
+        continue;
+      }
+
       await waitForActiveWindow();
 
       cycleCount += 1;
       const caption = await ensureNovelCaption();
-      if (!caption) { await new Promise(r => setTimeout(r, Math.min(15, minMin) * 60000)); continue; }
+      if (!caption) { await sleep(Math.min(15, minMin) * 60000); continue; }
 
       const shouldImage = enableImagePosts && (cycleCount % imageEvery === 0);
 
@@ -630,13 +722,12 @@ async function postingLoop() {
 
     const delay = randDelayMs();
     console.log(`Sleeping ${(delay / 60000).toFixed(0)} minutes...`);
-    await new Promise(r => setTimeout(r, delay));
+    await sleep(delay);
   }
 }
 
 /* =========================
    Discovery Sniper Loop
-   - Finds popular, verified authors automatically and replies
 ========================= */
 async function discoverySniperLoop() {
   if (!enableDiscoverySniper || discoveryQueries.length === 0) {
@@ -646,14 +737,21 @@ async function discoverySniperLoop() {
 
   while (true) {
     try {
+      if (Date.now() < llmDisabledUntilMs) {
+        const mins = Math.ceil((llmDisabledUntilMs - Date.now()) / 60000);
+        console.log(`(discovery) LLM cooling off; sleeping ${mins} minutes...`);
+        await sleep(Math.max(60000, llmDisabledUntilMs - Date.now()));
+        continue;
+      }
+
       resetDailyIfNeeded();
 
       if (repliesToday >= replyDailyCap) {
         console.log(`discoveryLoop: daily cap reached (${repliesToday}/${replyDailyCap}).`);
       } else if (Math.random() < discoveryProb) {
         const q = discoveryQueries[Math.floor(Math.random() * discoveryQueries.length)];
-        const lookbackIso = new Date(Date.now() - discoveryLookbackMinutes * 60000).toISOString();
-
+        const sinceMs = Date.now() - discoveryLookbackMinutes * 60000;
+        const lookbackIso = new Date(sinceMs).toISOString();
         const query = `${q} lang:en -is:retweet`;
 
         const res = await twitter.v2.search(query, {
@@ -669,28 +767,19 @@ async function discoverySniperLoop() {
 
         const tweets = (res.data?.data ?? []) as any[];
 
-        const sinceMs = Date.now() - discoveryLookbackMinutes * 60000;
         const candidates = tweets.filter((t: any) => {
           const fresh = t.created_at && new Date(t.created_at).getTime() >= sinceMs && t.created_at >= lookbackIso;
-
-          // keep only top-level (not replies/RTs)
           const isTopLevel = !(t.referenced_tweets && t.referenced_tweets.some((r: any) => r.type !== "replied_to"));
-
           const pm: any = t.public_metrics || {};
           const author = users.get(t.author_id as string);
           if (!author) return false;
-
           const followers = author.public_metrics?.followers_count ?? 0;
           const verified = !!author.verified;
-
           const fameOK = followers >= discoveryMinFollowers && (!discoveryRequireVerified || verified);
           const popOK = (pm.retweet_count ?? 0) >= discoveryMinRetweets;
-
           const authorId = t.author_id as string | undefined;
           if (!authorId) return false;
-
           const cooldownOK = !recentlyRepliedTo(authorId, recentAuthorCooldownMin);
-
           return fresh && isTopLevel && fameOK && popOK && cooldownOK;
         });
 
@@ -717,7 +806,7 @@ async function discoverySniperLoop() {
             }
             repliesToday += 1;
             recordAuthorReplied(authorId);
-            await new Promise(r => setTimeout(r, 5000 + Math.floor(Math.random() * 10000)));
+            await sleep(5000 + Math.floor(Math.random() * 10000));
           }
         } else {
           console.log("discoveryLoop: no suitable candidates this run.");
@@ -731,7 +820,7 @@ async function discoverySniperLoop() {
 
     const delay = randRangeMs(discoveryCheckMin, discoveryCheckMax);
     console.log(`discoveryLoop sleeping ${(delay / 60000).toFixed(0)} minutes...`);
-    await new Promise(r => setTimeout(r, delay));
+    await sleep(delay);
   }
 }
 
