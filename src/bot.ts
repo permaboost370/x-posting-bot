@@ -10,29 +10,19 @@ import character from "./character.js";
 
 const {
   // X / Twitter
-  X_API_KEY,
-  X_API_SECRET,
-  X_ACCESS_TOKEN,
-  X_ACCESS_SECRET,
+  X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET,
 
   // LLM
-  OPENAI_API_KEY,
-  OPENAI_BASE_URL,
-  OPENAI_MODEL = "gpt-4o-mini",
+  OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL = "gpt-4o-mini",
 
   // Posting cadence
-  POST_INTERVAL_MIN = "120",
-  POST_INTERVAL_MAX = "240",
-  POST_IMMEDIATELY = "false",
+  POST_INTERVAL_MIN = "120", POST_INTERVAL_MAX = "240", POST_IMMEDIATELY = "false",
 
   // Safety / ops
-  MAX_TWEET_LENGTH = "280",
-  DRY_RUN = "true",
+  MAX_TWEET_LENGTH = "280", DRY_RUN = "true",
 
   // (Optional) Active-hours — leave unset to post 24/7
-  ACTIVE_HOURS_START,
-  ACTIVE_HOURS_END,
-  TIMEZONE = "Europe/Athens",
+  ACTIVE_HOURS_START, ACTIVE_HOURS_END, TIMEZONE = "Europe/Athens",
 
   // Image posting controls
   ENABLE_IMAGE_POSTS = "false",   // "true" to enable image cycles
@@ -40,32 +30,48 @@ const {
   IMAGE_SIZE = "1024x1024",       // 256x256 | 512x512 | 1024x1024
   IMAGE_STYLE = "high-contrast, clean composition",
 
-  // --- NEW: Memory & Dedupe ---
+  // --- Memory & Dedupe ---
   MEMORY_ENABLED = "true",
   MEMORY_FILE = "/tmp/post_memory.json",
   MEMORY_MAX_POSTS = "500",
   MEMORY_TTL_DAYS = "14",
-  SIMILARITY_THRESHOLD = "0.5",           // token Jaccard, 0..1 (higher = stricter)
-  TOPIC_COOLDOWN_MINUTES = "240",         // avoid same topic for N minutes
-  MAX_REGEN_TRIES = "3",                  // tries to regenerate novel caption
-  SKIP_ON_DUPLICATE = "true",             // skip cycle if still dup after retries
+  SIMILARITY_THRESHOLD = "0.5",
+  TOPIC_COOLDOWN_MINUTES = "240",
+  MAX_REGEN_TRIES = "3",
+  SKIP_ON_DUPLICATE = "true",
 
-  // --- NEW: Image prompt steering ---
+  // --- Image prompt steering ---
   IMAGE_PROMPT_OVERRIDE,
   IMAGE_PROMPT_PREFIX = "",
   IMAGE_PROMPT_SUFFIX = "",
 
-  // --- NEW: Optional reference image (edits mode)
+  // --- Optional reference image (edits mode)
   IMAGE_REF_URL,
   IMAGE_REF_PATH,
   IMAGE_MASK_URL,
-  IMAGE_MASK_PATH
+  IMAGE_MASK_PATH,
+
+  // --- Discovery Sniper (auto replies)
+  ENABLE_DISCOVERY_SNIPER = "true",
+  DISCOVERY_QUERIES = "crypto,dao,defi,memecoin,airdrops",
+  DISCOVERY_MIN_FOLLOWERS = "300000",
+  DISCOVERY_REQUIRE_VERIFIED = "true",
+  DISCOVERY_MIN_RETWEETS = "50",
+  DISCOVERY_LOOKBACK_MINUTES = "360",
+  DISCOVERY_CHECK_INTERVAL_MIN = "20",
+  DISCOVERY_CHECK_INTERVAL_MAX = "60",
+  DISCOVERY_PROBABILITY = "0.5",
+  DISCOVERY_MAX_PER_RUN = "1",
+  RECENT_AUTHOR_COOLDOWN_MINUTES = "240",
+
+  // Reply caps / bounds
+  REPLY_DAILY_CAP = "12",
+  REPLY_MIN_LEN = "12",
+  REPLY_MAX_LEN = "280"
 } = process.env;
 
 // ----- guards -----
-function need(name: string, val?: string) {
-  if (!val) throw new Error(`Missing env ${name}`);
-}
+function need(name: string, val?: string) { if (!val) throw new Error(`Missing env ${name}`); }
 need("X_API_KEY", X_API_KEY);
 need("X_API_SECRET", X_API_SECRET);
 need("X_ACCESS_TOKEN", X_ACCESS_TOKEN);
@@ -74,10 +80,8 @@ need("OPENAI_API_KEY", OPENAI_API_KEY);
 
 // ----- clients -----
 const twitter = new TwitterApi({
-  appKey: X_API_KEY!,
-  appSecret: X_API_SECRET!,
-  accessToken: X_ACCESS_TOKEN!,
-  accessSecret: X_ACCESS_SECRET!
+  appKey: X_API_KEY!, appSecret: X_API_SECRET!,
+  accessToken: X_ACCESS_TOKEN!, accessSecret: X_ACCESS_SECRET!
 });
 
 const openai = new OpenAI({
@@ -94,6 +98,31 @@ const dryRun = /^true$/i.test(DRY_RUN!);
 
 const enableImagePosts = /^true$/i.test(ENABLE_IMAGE_POSTS!);
 const imageEvery = Math.max(1, parseInt(IMAGE_FREQUENCY!, 10));
+
+// Discovery sniper config
+const enableDiscoverySniper = /^true$/i.test(ENABLE_DISCOVERY_SNIPER!);
+const discoveryQueries = DISCOVERY_QUERIES.split(",").map(s => s.trim()).filter(Boolean);
+const discoveryMinFollowers = Math.max(0, parseInt(DISCOVERY_MIN_FOLLOWERS!, 10));
+const discoveryRequireVerified = /^true$/i.test(DISCOVERY_REQUIRE_VERIFIED!);
+const discoveryMinRetweets = Math.max(0, parseInt(DISCOVERY_MIN_RETWEETS!, 10));
+const discoveryLookbackMinutes = Math.max(15, parseInt(DISCOVERY_LOOKBACK_MINUTES!, 10));
+const discoveryCheckMin = Math.max(5, parseInt(DISCOVERY_CHECK_INTERVAL_MIN!, 10));
+const discoveryCheckMax = Math.max(discoveryCheckMin, parseInt(DISCOVERY_CHECK_INTERVAL_MAX!, 10));
+const discoveryProb = Math.min(1, Math.max(0, parseFloat(DISCOVERY_PROBABILITY!)));
+const discoveryMaxPerRun = Math.max(1, parseInt(DISCOVERY_MAX_PER_RUN!, 10));
+const recentAuthorCooldownMin = Math.max(0, parseInt(RECENT_AUTHOR_COOLDOWN_MINUTES!, 10));
+
+// Replies caps
+const replyDailyCap = Math.max(0, parseInt(REPLY_DAILY_CAP!, 10));
+const replyMinLen = Math.max(1, parseInt(REPLY_MIN_LEN!, 10));
+const replyMaxLen = Math.min(280, Math.max(60, parseInt(REPLY_MAX_LEN!, 10)));
+
+let repliesToday = 0;
+let repliesDayStamp = new Date().toISOString().slice(0, 10);
+function resetDailyIfNeeded() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== repliesDayStamp) { repliesDayStamp = d; repliesToday = 0; }
+}
 
 // ----- helpers: time / intervals -----
 function withinActiveHours(): boolean {
@@ -119,6 +148,10 @@ function msUntilActiveStart(): number {
 }
 function randDelayMs() {
   return (Math.floor(Math.random() * (maxMin - minMin + 1)) + minMin) * 60 * 1000;
+}
+function randRangeMs(minM: number, maxM: number) {
+  const mins = Math.floor(Math.random() * (maxM - minM + 1)) + minM;
+  return mins * 60 * 1000;
 }
 
 // ----- helpers: text gen -----
@@ -210,15 +243,12 @@ async function generateImage(prompt: string): Promise<string> {
     model: "gpt-image-1",
     prompt,
     size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
-    // don't pass response_format; some deployments reject it
   });
 
   const data = (res as any)?.data as Array<any> | undefined;
   if (!data || data.length === 0) {
     throw new Error("Image generation failed: empty response from Images API");
   }
-
-  // Prefer base64 if available
   const b64 = data[0]?.b64_json as string | undefined;
   if (b64) {
     const bytes = Buffer.from(b64, "base64");
@@ -227,11 +257,8 @@ async function generateImage(prompt: string): Promise<string> {
     fs.writeFileSync(filePath, bytes);
     return filePath;
   }
-
-  // Fallback to URL
   const url = data[0]?.url as string | undefined;
   if (url) {
-    // Node 18+ has global fetch
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`Failed to download image: ${resp.status} ${resp.statusText}`);
     const arrayBuf = await resp.arrayBuffer();
@@ -240,12 +267,11 @@ async function generateImage(prompt: string): Promise<string> {
     fs.writeFileSync(filePath, Buffer.from(arrayBuf));
     return filePath;
   }
-
   throw new Error("Image generation failed: neither b64_json nor url in response");
 }
 
 /* =========================
-   NEW: Memory (one-file)
+   Memory (posts, images, authors)
 ========================= */
 const memoryOn = /^true$/i.test(MEMORY_ENABLED!);
 const memoryFile = MEMORY_FILE!;
@@ -258,9 +284,10 @@ const skipOnDup = /^true$/i.test(SKIP_ON_DUPLICATE!);
 
 type PostRec = { hash: string; text: string; ts: number; topics: string[] };
 type ImgRec  = { hash: string; prompt: string; ts: number };
-type MemoryData = { posts: PostRec[]; images: ImgRec[]; lastPruned?: number };
+type AuthorRec = { id: string; ts: number };
+type MemoryData = { posts: PostRec[]; images: ImgRec[]; authors: AuthorRec[]; lastPruned?: number };
 
-function now() { return Date.now(); }
+function nowMs() { return Date.now(); }
 function days(n: number) { return n * 86400000; }
 function normalizeText(s: string) {
   return s
@@ -287,14 +314,14 @@ function jaccard(a: Set<string>, b: Set<string>) {
 }
 
 function loadMem(): MemoryData {
-  if (!memoryOn) return { posts: [], images: [] };
+  if (!memoryOn) return { posts: [], images: [], authors: [] };
   try {
     if (fs.existsSync(memoryFile)) {
       const d = JSON.parse(fs.readFileSync(memoryFile, "utf-8"));
-      return { posts: d.posts ?? [], images: d.images ?? [], lastPruned: d.lastPruned };
+      return { posts: d.posts ?? [], images: d.images ?? [], authors: d.authors ?? [], lastPruned: d.lastPruned };
     }
   } catch {}
-  return { posts: [], images: [] };
+  return { posts: [], images: [], authors: [] };
 }
 function saveMem(m: MemoryData) {
   if (!memoryOn) return;
@@ -304,11 +331,12 @@ const mem: MemoryData = loadMem();
 
 function pruneMem(force=false) {
   if (!memoryOn) return;
-  const t = now();
+  const t = nowMs();
   if (!force && mem.lastPruned && t - mem.lastPruned < 30*60000) return;
   const cutoff = t - days(memTtlDays);
   mem.posts = mem.posts.filter(p => p.ts >= cutoff).slice(-maxMemPosts);
   mem.images = mem.images.filter(i => i.ts >= cutoff).slice(-maxMemPosts);
+  mem.authors = mem.authors.filter(a => a.ts >= t - days(7)).slice(-2000);
   mem.lastPruned = t;
   saveMem(mem);
 }
@@ -328,10 +356,10 @@ function isDuplicateText(text: string): boolean {
 }
 function isTopicCooling(text: string): boolean {
   if (!topicCooldownMs) return false;
-  const nowMs = now();
+  const now = nowMs();
   const topics = new Set(extractTopics(text));
   for (const p of mem.posts) {
-    if (nowMs - p.ts > topicCooldownMs) continue;
+    if (now - p.ts > topicCooldownMs) continue;
     if (p.topics.some(tp => topics.has(tp))) return true;
   }
   return false;
@@ -339,7 +367,7 @@ function isTopicCooling(text: string): boolean {
 function rememberPost(text: string) {
   if (!memoryOn) return;
   const n = normalizeText(text);
-  mem.posts.push({ hash: sha256(n), text: n, ts: now(), topics: extractTopics(n) });
+  mem.posts.push({ hash: sha256(n), text: n, ts: nowMs(), topics: extractTopics(n) });
   pruneMem(true); saveMem(mem);
 }
 function seenImagePrompt(prompt: string): boolean {
@@ -357,8 +385,16 @@ function seenImagePrompt(prompt: string): boolean {
 function rememberImagePrompt(prompt: string) {
   if (!memoryOn) return;
   const n = normalizeText(prompt);
-  mem.images.push({ hash: sha256(n), prompt: n, ts: now() });
+  mem.images.push({ hash: sha256(n), prompt: n, ts: nowMs() });
   pruneMem(true); saveMem(mem);
+}
+function recordAuthorReplied(id: string) {
+  mem.authors.push({ id, ts: nowMs() });
+  pruneMem(true); saveMem(mem);
+}
+function recentlyRepliedTo(id: string, minutesCooldown: number) {
+  const cutoff = nowMs() - minutesCooldown * 60000;
+  return mem.authors.some(a => a.id === id && a.ts >= cutoff);
 }
 
 // ----- Image prompt steering / reference helpers -----
@@ -388,60 +424,71 @@ async function generateImageFromPromptOrReference(derivedPrompt: string): Promis
   const finalPrompt = buildFinalImagePrompt(derivedPrompt);
   const { refPath, maskPath } = await resolveRefAndMask();
   if (refPath) {
-    const params: any = {
-      model: "gpt-image-1",
-      prompt: finalPrompt,
-      image: fs.createReadStream(refPath),
-      size: IMAGE_SIZE as "256x256" | "512x512" | "1024x1024"
-    };
+    const params: any = { model: "gpt-image-1", prompt: finalPrompt, image: fs.createReadStream(refPath), size: IMAGE_SIZE as any };
     if (maskPath) params.mask = fs.createReadStream(maskPath);
-
     const res = await (openai as any).images.edits(params);
     const data = (res as any)?.data as Array<any> | undefined;
     if (!data || data.length === 0) throw new Error("Image edit failed: empty response");
-
     const b64 = data[0]?.b64_json as string | undefined;
-    if (b64) {
-      const file = path.join("/tmp", `edit_${Date.now()}.png`);
-      fs.writeFileSync(file, Buffer.from(b64, "base64"));
-      return file;
-    }
+    if (b64) { const file = path.join("/tmp", `edit_${Date.now()}.png`); fs.writeFileSync(file, Buffer.from(b64, "base64")); return file; }
     const url = data[0]?.url as string | undefined;
     if (url) return await downloadToTmp(url, "edit");
     throw new Error("Image edit failed: neither b64_json nor url");
   }
-  // Fallback: plain text→image
   return await generateImage(finalPrompt);
 }
 
 // ----- posting -----
 async function postTweet(text: string) {
-  if (dryRun) {
-    console.log("[DRY RUN] Would post TEXT:\n" + text);
-    return { id: "dryrun" };
-  }
+  if (dryRun) { console.log("[DRY RUN] Would post TEXT:\n" + text); return { id: "dryrun" }; }
   const res = await twitter.v2.tweet(text);
   console.log("Posted tweet id:", res.data?.id);
   return { id: res.data?.id as string | undefined };
 }
-
 async function postImageTweet(imagePath: string, text: string, altText?: string) {
-  if (dryRun) {
-    console.log("[DRY RUN] Would post IMAGE:", imagePath);
-    console.log("[DRY RUN] Caption:", text);
-    return { id: "dryrun" };
-  }
+  if (dryRun) { console.log("[DRY RUN] Would post IMAGE:", imagePath); console.log("[DRY RUN] Caption:", text); return { id: "dryrun" }; }
   const mediaId = await twitter.v1.uploadMedia(imagePath);
   if (altText && altText.trim()) {
-    try {
-      await twitter.v1.createMediaMetadata(mediaId, { alt_text: { text: altText.slice(0, 1000) } });
-    } catch (e) {
-      console.warn("ALT text set failed (non-fatal):", e);
-    }
+    try { await twitter.v1.createMediaMetadata(mediaId, { alt_text: { text: altText.slice(0, 1000) } }); } catch (e) { console.warn("ALT text set failed (non-fatal):", e); }
   }
   const res = await twitter.v2.tweet({ text, media: { media_ids: [mediaId] } as any });
   console.log("Posted image tweet id:", res.data?.id);
   return { id: res.data?.id as string | undefined };
+}
+
+// ----- replies: generation -----
+async function generateReplyForTweet(sourceText: string, authorHandle?: string): Promise<string> {
+  const sys = [
+    `${(character as any).name || "Dao-Man"} — reply mode:`,
+    ...((character as any).style?.chatStyle ?? []),
+    ...((character as any).style?.allStyles ?? []),
+    "",
+    "Constraints:",
+    "- Short, human, value-adding. No hashtags/emojis.",
+    "- Add one lever, heuristic, or next action.",
+    `- 1–3 lines; ${replyMaxLen} chars max.`
+  ].join("\n");
+
+  const usr = [
+    `You're replying to ${authorHandle ? "@" + authorHandle : "a tweet"}:`,
+    sourceText,
+    "",
+    "Write ONE reply in this voice. Return ONLY the reply text."
+  ].join("\n");
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL!,
+    temperature: 0.7,
+    max_tokens: 160,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: usr }
+    ]
+  });
+
+  const text = resp.choices?.[0]?.message?.content?.trim() || "";
+  const trimmed = trimTweet(text, replyMaxLen);
+  return trimmed.length >= replyMinLen ? trimmed : "";
 }
 
 // ----- main loop -----
@@ -454,15 +501,15 @@ async function waitForActiveWindow() {
 
 async function ensureNovelCaption(): Promise<string | null> {
   let lastDraft = "";
-  for (let attempt = 1; attempt <= maxRegen; attempt++) {
+  for (let attempt = 1; attempt <= Math.max(1, parseInt(MAX_REGEN_TRIES!,10)); attempt++) {
     const draft = await generateTweet();
     lastDraft = draft;
     const dup = isDuplicateText(draft);
     const hot = isTopicCooling(draft);
     if (!dup && !hot) return draft;
-    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${maxRegen}`);
+    console.log(`Caption rejected (dup=${dup}, hotTopic=${hot}) — attempt ${attempt}/${MAX_REGEN_TRIES}`);
   }
-  if (skipOnDup) {
+  if (/^true$/i.test(SKIP_ON_DUPLICATE!)) {
     console.log("Caption remained duplicate after retries; skipping this cycle.");
     return null;
   }
@@ -470,7 +517,7 @@ async function ensureNovelCaption(): Promise<string | null> {
   return lastDraft;
 }
 
-async function loop() {
+async function postingLoop() {
   let cycleCount = 0;
   while (true) {
     try {
@@ -478,35 +525,24 @@ async function loop() {
 
       cycleCount += 1;
       const caption = await ensureNovelCaption();
-      if (!caption) {
-        // Soft skip: wait a short time then continue
-        const short = Math.min(15, minMin) * 60 * 1000;
-        await new Promise(r => setTimeout(r, short));
-        continue;
-      }
+      if (!caption) { await new Promise(r => setTimeout(r, Math.min(15, minMin) * 60000)); continue; }
 
       const shouldImage = enableImagePosts && (cycleCount % imageEvery === 0);
 
       if (shouldImage) {
         let imagePrompt = await buildImagePromptFromCaption(caption);
-        // memory-aware image prompt
-        if (seenImagePrompt(imagePrompt)) {
-          imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
-        }
-
+        if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
         const finalPrompt = buildFinalImagePrompt(imagePrompt);
         const imgPath = await generateImageFromPromptOrReference(finalPrompt);
         const altText = await buildAltTextFromCaption(caption, finalPrompt);
-
         console.log("Image prompt:", finalPrompt);
         console.log("Generated image:", imgPath);
-
-        const { id } = await postImageTweet(imgPath, caption, altText);
+        await postImageTweet(imgPath, caption, altText);
         rememberImagePrompt(finalPrompt);
         rememberPost(caption);
       } else {
         console.log("Generated:", caption);
-        const { id } = await postTweet(caption);
+        await postTweet(caption);
         rememberPost(caption);
       }
     } catch (e) {
@@ -515,6 +551,98 @@ async function loop() {
 
     const delay = randDelayMs();
     console.log(`Sleeping ${(delay / 60000).toFixed(0)} minutes...`);
+    await new Promise(r => setTimeout(r, delay));
+  }
+}
+
+/* =========================
+   Discovery Sniper Loop
+   - Finds popular, verified authors automatically and replies
+========================= */
+async function discoverySniperLoop() {
+  if (!enableDiscoverySniper || discoveryQueries.length === 0) {
+    console.log("Discovery sniper disabled or no DISCOVERY_QUERIES.");
+    return;
+  }
+
+  while (true) {
+    try {
+      resetDailyIfNeeded();
+
+      if (repliesToday >= replyDailyCap) {
+        console.log(`discoveryLoop: daily cap reached (${repliesToday}/${replyDailyCap}).`);
+      } else if (Math.random() < discoveryProb) {
+        const q = discoveryQueries[Math.floor(Math.random() * discoveryQueries.length)];
+        const lookbackIso = new Date(Date.now() - discoveryLookbackMinutes * 60000).toISOString();
+
+        // Bias to English, no RT/replies; we also filter top-level later
+        const query = `${q} lang:en -is:retweet`;
+
+        const res = await twitter.v2.search(query, {
+          max_results: 50,
+          "tweet.fields": ["author_id","created_at","public_metrics","referenced_tweets","conversation_id"],
+          expansions: ["author_id"],
+          "user.fields": ["username","verified","public_metrics"]
+        });
+
+        const users = new Map<string, any>();
+        const incUsers = (res as any)?.includes?.users as any[] | undefined;
+        if (incUsers) for (const u of incUsers) users.set(u.id, u);
+
+        const tweets = res.data?.data ?? [];
+        const sinceMs = Date.now() - discoveryLookbackMinutes * 60000;
+        const candidates = tweets.filter(t => {
+          const fresh = t.created_at && new Date(t.created_at).getTime() >= sinceMs && t.created_at >= lookbackIso;
+          const isTopLevel = !(t.referenced_tweets && t.referenced_tweets.some((r: any) => r.type !== "replied_to"));
+          const pm = t.public_metrics || {};
+          const author = users.get(t.author_id);
+          if (!author) return false;
+          const followers = author.public_metrics?.followers_count ?? 0;
+          const verified = !!author.verified;
+
+          const fameOK = followers >= discoveryMinFollowers && (!discoveryRequireVerified || verified);
+          const popOK = (pm.retweet_count ?? 0) >= discoveryMinRetweets;
+
+          const cooldownOK = !recentlyRepliedTo(t.author_id, recentAuthorCooldownMin);
+
+          return fresh && isTopLevel && fameOK && popOK && cooldownOK;
+        });
+
+        if (candidates.length > 0) {
+          // Select up to N random candidates this run
+          const shuffled = candidates.sort(() => Math.random() - 0.5).slice(0, discoveryMaxPerRun);
+          for (const t of shuffled) {
+            if (repliesToday >= replyDailyCap) break;
+
+            const author = users.get(t.author_id);
+            const handle = author?.username as string | undefined;
+
+            const replyText = await generateReplyForTweet(t.text, handle);
+            if (!replyText) continue;
+
+            if (dryRun) {
+              console.log(`[DRY RUN] Discovery reply to @${handle} (${t.id}):\n${replyText}`);
+            } else {
+              const posted = await twitter.v2.reply(replyText, t.id);
+              console.log("Discovery replied to", handle, "tweetId:", t.id, "→", posted.data?.id);
+            }
+            repliesToday += 1;
+            recordAuthorReplied(t.author_id);
+            // small human-ish pause if multiple
+            await new Promise(r => setTimeout(r, 5000 + Math.floor(Math.random() * 10000)));
+          }
+        } else {
+          console.log("discoveryLoop: no suitable candidates this run.");
+        }
+      } else {
+        console.log("discoveryLoop: probability gate skipped this run.");
+      }
+    } catch (e) {
+      console.error("discoverySniperLoop error:", e);
+    }
+
+    const delay = randRangeMs(discoveryCheckMin, discoveryCheckMax);
+    console.log(`discoveryLoop sleeping ${(delay / 60000).toFixed(0)} minutes...`);
     await new Promise(r => setTimeout(r, delay));
   }
 }
@@ -529,9 +657,7 @@ async function loop() {
       if (caption) {
         if (enableImagePosts && imageEvery === 1) {
           let imagePrompt = await buildImagePromptFromCaption(caption);
-          if (seenImagePrompt(imagePrompt)) {
-            imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
-          }
+          if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
           const finalPrompt = buildFinalImagePrompt(imagePrompt);
           const imgPath = await generateImageFromPromptOrReference(finalPrompt);
           const altText = await buildAltTextFromCaption(caption, finalPrompt);
@@ -549,5 +675,10 @@ async function loop() {
       console.error("Immediate post failed:", e);
     }
   }
-  await loop();
+
+  // Run posting + discovery in parallel
+  await Promise.all([
+    postingLoop(),
+    discoverySniperLoop()
+  ]);
 })();
