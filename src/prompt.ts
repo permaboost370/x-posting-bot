@@ -1,7 +1,7 @@
 import character from "./character.js";
 type Char = typeof character;
 
-export function buildTweetPrompt(c: Char) {
+export function buildTweetPrompt(c: Char, opts?: { trending?: string[]; topics?: string[]; maxLen?: number }) {
   const name = (c as any).name ?? "Bot";
   const bio = Array.isArray((c as any).bio) ? (c as any).bio.join(" ") : ((c as any).bio ?? "");
   const style = [
@@ -24,10 +24,15 @@ export function buildTweetPrompt(c: Char) {
     "- Must fit within MAX_TWEET_LENGTH characters."
   ].join("\n");
 
+  const trending = (opts?.trending ?? []).slice(0,3).join(" ");
+  const topical = (opts?.topics ?? []).slice(0,5).join(", ");
+
   const user = [
     `Bio/context: ${bio}`,
     "",
     "Write ONE X post in this voice. Avoid links.",
+    trending ? `If natural, you MAY include 1 relevant trending tag: ${"${trending}"}` : "",
+    topical ? `Stay within topics: ${"${topical}"}` : "",
     "Return ONLY the post text—no explanations."
   ].join("\n");
 
