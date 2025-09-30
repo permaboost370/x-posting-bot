@@ -9,17 +9,20 @@ import character from "./character.js";
 import { buildTweetPrompt } from "./prompt.js";
 
 // Optional logging util — if you don't have it, handlers will still work
-let logEvent: (t: string, data?: any) => Promise<void>;
-let getRecentLogs: (n: number) => Array<{ t: string; caption?: string; text?: string; tweet_id?: string }>;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const logging = await import("./util/logging.js");
-  logEvent = logging.logEvent;
-  getRecentLogs = logging.getRecentLogs;
-} catch {
-  logEvent = async () => {};
-  getRecentLogs = () => [];
-}
+logEvent = async () => {};
+getRecentLogs = () => [];
+
+(async () => {
+  try {
+    const logging = await import("./util/logging.js");
+    // @ts-ignore dynamic import types
+    logEvent = logging.logEvent;
+    // @ts-ignore dynamic import types
+    getRecentLogs = logging.getRecentLogs;
+  } catch {
+    // keep the no-op fallbacks defined above
+  }
+})();
 
 /* ============== ENV ============== */
 const {
