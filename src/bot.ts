@@ -9,7 +9,7 @@ import { fileFromPath } from "openai/uploads";
 import { buildTweetPrompt } from "./prompt.js";
 import character from "./character.js";
 // NEW: allow starting the Telegram controller from here (optional)
-import { startTelegram } from "./telegram.ts";
+import { startTelegram } from "./telegram.js";
 
 /* =========================
    ENV
