@@ -7,9 +7,7 @@ import { fileFromPath } from "openai/uploads";
 import { TwitterApi } from "twitter-api-v2";
 import character from "./character.js";
 import { buildTweetPrompt } from "./prompt.js";
-import { getState, setState, postsToday } from "./state.js";
-import { fetchTrendingHashtags } from "./trending.js";
-
+import { getState, setState, postsToday } from "./state.js"; // NEW
 
 /* ========= Optional logging (safe fallbacks, no top-level await) ========= */
 // NOTE: We declare typed no-op functions first, then try to replace them via dynamic import.
@@ -376,68 +374,81 @@ export function startTelegram() {
     }
   });
 
+  /* ======================= NEW COMMANDS ======================= */
 
-  /* ====== /pause & /resume ====== */
+  // /pause — pause autoposting
   bot.onText(/^\/pause$/, async (msg: TelegramBot.Message) => {
-    const st = setState({ paused: true });
-    return bot.sendMessage(msg.chat.id, `⏸️ Autoposting paused.`);
-  });
-  bot.onText(/^\/resume$/, async (msg: TelegramBot.Message) => {
-    const st = setState({ paused: false });
-    return bot.sendMessage(msg.chat.id, `▶️ Autoposting resumed.`);
+    if (!guard(msg)) return;
+    setState({ paused: true });
+    bot!.sendMessage(msg.chat.id, "⏸️ Autoposting is now *paused*. Use /resume to start again.", { parse_mode: "Markdown", reply_to_message_id: msg.message_id });
   });
 
-  /* ====== /status ====== */
+  // /resume — resume autoposting
+  bot.onText(/^\/resume$/, async (msg: TelegramBot.Message) => {
+    if (!guard(msg)) return;
+    setState({ paused: false });
+    bot!.sendMessage(msg.chat.id, "▶️ Autoposting *resumed*.", { parse_mode: "Markdown", reply_to_message_id: msg.message_id });
+  });
+
+  // /status — uptime, posts today, current interval window
   bot.onText(/^\/status$/, async (msg: TelegramBot.Message) => {
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime/3600), mins = Math.floor((uptime%3600)/60);
+    if (!guard(msg)) return;
+    const uptimeSec = Math.floor(process.uptime());
+    const hours = Math.floor(uptimeSec / 3600);
+    const mins = Math.floor((uptimeSec % 3600) / 60);
     const st = getState();
-    const posts = postsToday();
+    const today = postsToday();
     const intervalMin = Number(process.env.POST_INTERVAL_MIN || 120);
     const intervalMax = Number(process.env.POST_INTERVAL_MAX || 240);
+
     const text = [
       "📡 *Status*",
       `• Uptime: ${hours}h ${mins}m`,
       `• Paused: ${st.paused ? "yes" : "no"} | Dry-run: ${(process.env.DRY_RUN ?? "false")}`,
-      `• Posts today: ${posts}`,
-      `• Interval window: ${intervalMin}-${intervalMax} min`
+      `• Posts today: ${today}`,
+      `• Interval window: ${intervalMin}-${intervalMax} min`,
     ].join("\n");
-    return bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
+
+    bot!.sendMessage(msg.chat.id, text, { parse_mode: "Markdown", reply_to_message_id: msg.message_id });
   });
 
-  /* ====== /stats [days] ====== */
+  // /stats [days] — totals via v2 public_metrics
   bot.onText(/^\/stats(?:\s+(\d+))?$/, async (msg: TelegramBot.Message, m: RegExpExecArray | null) => {
+    if (!guard(msg)) return;
     const days = Math.min(90, Math.max(1, parseInt(m?.[1] || "7", 10)));
-    const since = Date.now() - days*24*3600*1000;
+    const since = Date.now() - days * 24 * 3600 * 1000;
     const st = getState();
     const ids = st.posts.filter(p => p.ts >= since).map(p => p.id);
-    if (!ids.length) return bot.sendMessage(msg.chat.id, `No posts in the last ${days} days.`);
+
+    if (!ids.length) {
+      bot!.sendMessage(msg.chat.id, `No posts in the last ${days} days.`, { reply_to_message_id: msg.message_id });
+      return;
+    }
 
     try {
-      const twitter = new TwitterApi({
-        appKey: process.env.TWITTER_API_KEY!,
-        appSecret: process.env.TWITTER_API_SECRET!,
-        accessToken: process.env.TWITTER_ACCESS_TOKEN!,
-        accessSecret: process.env.TWITTER_ACCESS_SECRET!,
-      });
       const res: any = await twitter.v2.tweets(ids, { "tweet.fields": ["public_metrics","created_at"] });
       const rows = (res?.data ?? []) as any[];
-      const totals = rows.reduce((a, r) => {
-        const m = r.public_metrics || {};
-        a.likes += m.like_count || 0;
-        a.retweets += m.retweet_count || 0;
-        a.replies += m.reply_count || 0;
-        a.quotes += m.quote_count || 0;
-        return a;
-      }, { likes:0, retweets:0, replies:0, quotes:0 });
+      const totals = rows.reduce(
+        (a, r) => {
+          const m = r.public_metrics || {};
+          a.likes += m.like_count || 0;
+          a.retweets += m.retweet_count || 0;
+          a.replies += m.reply_count || 0;
+          a.quotes += m.quote_count || 0;
+          return a;
+        },
+        { likes: 0, retweets: 0, replies: 0, quotes: 0 }
+      );
+
       const text = [
         `📊 *Stats (${days}d)*`,
         `Total posts: ${rows.length}`,
         `♥️ ${totals.likes}  🔁 ${totals.retweets}  💬 ${totals.replies}  🗣️ ${totals.quotes}`
       ].join("\n");
-      return bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
-    } catch (e:any) {
-      return bot.sendMessage(msg.chat.id, `Error fetching stats: ${e?.message || e}`);
+
+      bot!.sendMessage(msg.chat.id, text, { parse_mode: "Markdown", reply_to_message_id: msg.message_id });
+    } catch (e: any) {
+      bot!.sendMessage(msg.chat.id, `Error fetching stats: ${e?.message || e}`, { reply_to_message_id: msg.message_id });
     }
   });
 
