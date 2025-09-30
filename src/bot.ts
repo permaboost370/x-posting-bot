@@ -863,43 +863,35 @@ export { buildImagePromptFromCaption, buildAltTextFromCaption, generateImageFrom
    Bootstrap (RUN_MODE: loop | telegram | both)
 ========================= */
 (async () => {
-  const mode = (RUN_MODE || "both").toLowerCase();
+  if (postImmediately) {
+    try {
+      await waitForActiveWindow();
+      const caption = await ensureNovelCaption();
 
-  if (mode === "telegram" || mode === "both") {
-    // Starts the Telegram bot (commands: /health, /log, /tweet, /custom ...)
-    startTelegram();
+      if (caption) {
+        if (enableImagePosts && imageEvery === 1) {
+          let imagePrompt = await buildImagePromptFromCaption(caption);
+          if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
+          const finalPrompt = buildFinalImagePrompt(imagePrompt);
+          const imgPath = await generateImageFromPromptOrReference(finalPrompt);
+          const altText = await buildAltTextFromCaption(caption, finalPrompt);
+          console.log("Image prompt (immediate):", finalPrompt);
+          await postImageTweet(imgPath, caption, altText);
+          rememberImagePrompt(finalPrompt);
+          rememberPost(caption);
+        } else {
+          console.log("Generated (immediate):", caption);
+          await postTweet(caption);
+          rememberPost(caption);
+        }
+      }
+    } catch (e) {
+      console.error("Immediate post failed:", e);
+    }
   }
 
-  if (mode === "loop" || mode === "both") {
-    if (postImmediately) {
-      try {
-        await waitForActiveWindow();
-        const caption = await ensureNovelCaption();
-
-        if (caption) {
-          if (enableImagePosts && imageEvery === 1) {
-            let imagePrompt = await buildImagePromptFromCaption(caption);
-            if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
-            const finalPrompt = buildFinalImagePrompt(imagePrompt);
-            const imgPath = await generateImageFromPromptOrReference(finalPrompt);
-            const altText = await buildAltTextFromCaption(caption, finalPrompt);
-            console.log("Image prompt (immediate):", finalPrompt);
-            await postImageTweet(imgPath, caption, altText);
-            rememberImagePrompt(finalPrompt);
-            rememberPost(caption);
-          } else {
-            console.log("Generated (immediate):", caption);
-            await postTweet(caption);
-            rememberPost(caption);
-          }
-        }
-      } catch (e) {
-        console.error("Immediate post failed:", e);
-      }
-    }
-
-    // Run posting + discovery in parallel
-    await Promise.all([
+  // ✅ Run posting + discovery + telegram in parallel
+  await Promise.all([
     postingLoop(),
     discoverySniperLoop(),
     (async () => startTelegram())()
