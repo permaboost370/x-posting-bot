@@ -8,26 +8,27 @@ import { TwitterApi } from "twitter-api-v2";
 import character from "./character.js";
 import { buildTweetPrompt } from "./prompt.js";
 
-// Optional logging util — if you don't have it, handlers will still work
-logEvent = async () => {};
-getRecentLogs = () => [];
+/* ========= Optional logging (safe fallbacks, no top-level await) ========= */
+// NOTE: We declare typed no-op functions first, then try to replace them via dynamic import.
+let logEvent: (t: string, data?: any) => Promise<void> = async () => {};
+let getRecentLogs: (n: number) => Array<{ t: string; caption?: string; text?: string; tweet_id?: string }> = () => [];
 
 (async () => {
   try {
     const logging = await import("./util/logging.js");
-    // @ts-ignore dynamic import types
+    // @ts-ignore - dynamic import of JS module
     logEvent = logging.logEvent;
-    // @ts-ignore dynamic import types
+    // @ts-ignore - dynamic import of JS module
     getRecentLogs = logging.getRecentLogs;
   } catch {
-    // keep the no-op fallbacks defined above
+    // keep no-op fallbacks
   }
 })();
 
-/* ============== ENV ============== */
+/* ============================= ENV ============================= */
 const {
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID, // optional allowlist
+  TELEGRAM_CHAT_ID, // optional allowlist (string chat id)
   OPENAI_API_KEY,
   OPENAI_BASE_URL,
   OPENAI_MODEL = "gpt-4o-mini",
@@ -50,7 +51,7 @@ if (!X_API_KEY || !X_API_SECRET || !X_ACCESS_TOKEN || !X_ACCESS_SECRET) {
   throw new Error("Missing one of X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / X_ACCESS_SECRET");
 }
 
-/* ============== Clients ============== */
+/* ============================= Clients ============================= */
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY!,
   baseURL: OPENAI_BASE_URL, // leave undefined for native OpenAI
@@ -61,7 +62,7 @@ const twitter = new TwitterApi({
   accessToken: X_ACCESS_TOKEN!, accessSecret: X_ACCESS_SECRET!,
 });
 
-/* ============== Small helpers copied (minimal) ============== */
+/* =================== Helpers (trim, prompts, files) =================== */
 function trimTweet(s: string, limit: number) {
   const t = s.trim().replace(/^"|"$/g, "");
   if (t.length <= limit) return t;
@@ -131,10 +132,12 @@ function guessMimeByExt(p: string): string {
   if (x.endsWith(".webp")) return "image/webp";
   return "image/png";
 }
+
 function resolveMaybeRelative(p?: string) {
   if (!p) return undefined as string | undefined;
   return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
 }
+
 async function downloadToTmp(url: string, tag = "ref"): Promise<string> {
   const resp = await fetch(url, { redirect: "follow" });
   if (!resp.ok) throw new Error(`Download failed ${resp.status} ${resp.statusText} for ${url}`);
@@ -157,7 +160,7 @@ async function downloadToTmp(url: string, tag = "ref"): Promise<string> {
 }
 
 async function resolveRefAndMask(): Promise<{ refPath?: string; maskPath?: string }> {
-  let refPath: string | undefined; 
+  let refPath: string | undefined;
   let maskPath: string | undefined;
 
   try {
@@ -255,7 +258,7 @@ async function generateImageFromPromptOrReference(derivedPrompt: string): Promis
   }
 }
 
-/* ============== Telegram wiring ============== */
+/* ========================= Telegram wiring ========================= */
 let bot: TelegramBot | null = null;
 
 function guard(msg: TelegramBot.Message): boolean {
@@ -268,13 +271,13 @@ export function startTelegram() {
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN!, { polling: true });
 
   // /health
-  bot.onText(/^\/health$/, async (msg) => {
+  bot.onText(/^\/health$/, async (msg: TelegramBot.Message) => {
     if (!guard(msg)) return;
     bot!.sendMessage(msg.chat.id, "✅ Bot is alive and connected.", { reply_to_message_id: msg.message_id });
   });
 
   // /log
-  bot.onText(/^\/log$/, async (msg) => {
+  bot.onText(/^\/log$/, async (msg: TelegramBot.Message) => {
     if (!guard(msg)) return;
     const logs = getRecentLogs ? getRecentLogs(5) : [];
     const out = logs.map(l => {
@@ -285,7 +288,7 @@ export function startTelegram() {
   });
 
   // /tweet → auto caption + image (using your character + prompt builder)
-  bot.onText(/^\/tweet$/, async (msg) => {
+  bot.onText(/^\/tweet$/, async (msg: TelegramBot.Message) => {
     if (!guard(msg)) return;
     try {
       const { system, user, fewshot } = buildTweetPrompt(character as any);
@@ -301,7 +304,7 @@ export function startTelegram() {
         max_tokens: 200,
         messages,
       });
-      let caption = trimTweet(resp.choices?.[0]?.message?.content ?? "", 280);
+      const caption = trimTweet(resp.choices?.[0]?.message?.content ?? "", 280);
 
       const visualPrompt = await buildImagePromptFromCaption(caption);
       const finalPrompt = `${visualPrompt}\nStyle: ${IMAGE_STYLE}`;
@@ -329,7 +332,7 @@ export function startTelegram() {
   });
 
   // /custom CAPTION | PROMPT
-  bot.onText(/^\/custom (.+)$/s, async (msg, match) => {
+  bot.onText(/^\/custom (.+)$/s, async (msg: TelegramBot.Message, match: RegExpExecArray | null) => {
     if (!guard(msg)) return;
     try {
       const body = (match?.[1] || "").trim();
