@@ -9,7 +9,7 @@ import { fileFromPath } from "openai/uploads";
 import { buildTweetPrompt } from "./prompt.js";
 import character from "./character.js";
 // NEW: allow starting the Telegram controller from here (optional)
-import { startTelegram } from "./telegram.js";
+import { startTelegram } from "./telegram.ts";
 
 /* =========================
    ENV
@@ -900,8 +900,8 @@ export { buildImagePromptFromCaption, buildAltTextFromCaption, generateImageFrom
 
     // Run posting + discovery in parallel
     await Promise.all([
-      postingLoop(),
-      discoverySniperLoop()
-    ]);
-  }
+    postingLoop(),
+    discoverySniperLoop(),
+    (async () => startTelegram())()
+  ]);
 })();
