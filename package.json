@@ -5,16 +5,23 @@
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/bot.js"
+    "start": "node dist/bot.js",
+    "start:server": "cross-env RUN_MODE=server node dist/bot.js",
+    "start:loop": "cross-env RUN_MODE=loop node dist/bot.js",
+    "start:telegram": "cross-env RUN_MODE=telegram node dist/bot.js",
+    "start:both": "cross-env RUN_MODE=both node dist/bot.js",
+    "postinstall": "npm run build"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "express": "^4.18.2",
     "openai": "^4.56.0",
-    "twitter-api-v2": "^1.16.0"
+    "twitter-api-v2": "^1.16.0",
     "node-telegram-bot-api": "^0.61.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "cross-env": "^7.0.3"
   }
 }
