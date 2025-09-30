@@ -8,6 +8,8 @@ import OpenAI from "openai";
 import { fileFromPath } from "openai/uploads";
 import { buildTweetPrompt } from "./prompt.js";
 import character from "./character.js";
+// NEW: allow starting the Telegram controller from here (optional)
+import { startTelegram } from "./telegram.js";
 
 /* =========================
    ENV
@@ -76,7 +78,10 @@ const {
   // LLM retry / cool-off
   LLM_RETRY_MAX = "4",
   LLM_RETRY_BASE_MS = "1500",
-  LLM_ON_429_SLEEP_MIN = "60"
+  LLM_ON_429_SLEEP_MIN = "60",
+
+  // Run mode (NEW)
+  RUN_MODE = "both" // loop | telegram | both
 } = process.env;
 
 /* =========================
@@ -849,39 +854,54 @@ async function discoverySniperLoop() {
 }
 
 /* =========================
-   Bootstrap
+   EXPORTS (used by Telegram controller)
+========================= */
+export { trimTweet };
+export { buildImagePromptFromCaption, buildAltTextFromCaption, generateImageFromPromptOrReference };
+
+/* =========================
+   Bootstrap (RUN_MODE: loop | telegram | both)
 ========================= */
 (async () => {
-  if (postImmediately) {
-    try {
-      await waitForActiveWindow();
-      const caption = await ensureNovelCaption();
+  const mode = (RUN_MODE || "both").toLowerCase();
 
-      if (caption) {
-        if (enableImagePosts && imageEvery === 1) {
-          let imagePrompt = await buildImagePromptFromCaption(caption);
-          if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
-          const finalPrompt = buildFinalImagePrompt(imagePrompt);
-          const imgPath = await generateImageFromPromptOrReference(finalPrompt);
-          const altText = await buildAltTextFromCaption(caption, finalPrompt);
-          console.log("Image prompt (immediate):", finalPrompt);
-          await postImageTweet(imgPath, caption, altText);
-          rememberImagePrompt(finalPrompt);
-          rememberPost(caption);
-        } else {
-          console.log("Generated (immediate):", caption);
-          await postTweet(caption);
-          rememberPost(caption);
-        }
-      }
-    } catch (e) {
-      console.error("Immediate post failed:", e);
-    }
+  if (mode === "telegram" || mode === "both") {
+    // Starts the Telegram bot (commands: /health, /log, /tweet, /custom ...)
+    startTelegram();
   }
 
-  // Run posting + discovery in parallel
-  await Promise.all([
-    postingLoop(),
-    discoverySniperLoop()
-  ]);
+  if (mode === "loop" || mode === "both") {
+    if (postImmediately) {
+      try {
+        await waitForActiveWindow();
+        const caption = await ensureNovelCaption();
+
+        if (caption) {
+          if (enableImagePosts && imageEvery === 1) {
+            let imagePrompt = await buildImagePromptFromCaption(caption);
+            if (seenImagePrompt(imagePrompt)) imagePrompt += `\nVariation: different angle, altered lighting, distinct color palette.`;
+            const finalPrompt = buildFinalImagePrompt(imagePrompt);
+            const imgPath = await generateImageFromPromptOrReference(finalPrompt);
+            const altText = await buildAltTextFromCaption(caption, finalPrompt);
+            console.log("Image prompt (immediate):", finalPrompt);
+            await postImageTweet(imgPath, caption, altText);
+            rememberImagePrompt(finalPrompt);
+            rememberPost(caption);
+          } else {
+            console.log("Generated (immediate):", caption);
+            await postTweet(caption);
+            rememberPost(caption);
+          }
+        }
+      } catch (e) {
+        console.error("Immediate post failed:", e);
+      }
+    }
+
+    // Run posting + discovery in parallel
+    await Promise.all([
+      postingLoop(),
+      discoverySniperLoop()
+    ]);
+  }
 })();
