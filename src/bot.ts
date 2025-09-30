@@ -7,6 +7,8 @@ import { TwitterApi } from "twitter-api-v2";
 import OpenAI from "openai";
 import { fileFromPath } from "openai/uploads";
 import { buildTweetPrompt } from "./prompt.js";
+import { getState, recordPost } from "./state.js";
+import { fetchTrendingHashtags } from "./trending.js";
 import character from "./character.js";
 // NEW: allow starting the Telegram controller from here (optional)
 import { startTelegram } from "./telegram.js";
@@ -222,7 +224,13 @@ function trimTweet(s: string, limit: number) {
   return (last > 50 ? cut.slice(0, last + 1) : cut).trim();
 }
 async function generateTweet(): Promise<string> {
-  const { system, user, fewshot } = buildTweetPrompt(character as any);
+    // Trending injection (optional)
+  let trending: string[] = [];
+  try {
+    const candidate = (character as any)?.twitter?.hashtags?.map((h: string)=>h.replace(/^#/,"")) ?? ["ai","startups","crypto"];
+    trending = await fetchTrendingHashtags(twitter, candidate, 60);
+  } catch {}
+const { system, user, fewshot } = buildTweetPrompt(character as any, { trending });
   const messages: OpenAI.ChatCompletionMessageParam[] = [
     { role: "system", content: system },
     { role: "user", content: user }
@@ -774,6 +782,7 @@ async function discoverySniperLoop() {
       }
 
       resetDailyIfNeeded();
+      if (getState().paused) { await sleep(30_000); continue; }
 
       if (repliesToday >= replyDailyCap) {
         console.log(`discoveryLoop: daily cap reached (${repliesToday}/${replyDailyCap}).`);
@@ -897,3 +906,51 @@ export { buildImagePromptFromCaption, buildAltTextFromCaption, generateImageFrom
     (async () => startTelegram())()
   ]);
 })();
+
+/* =========================
+   Auto-engage (mentions)
+========================= */
+async function runAutoEngage() {
+  if ((process.env.AUTO_ENGAGE ?? "false").toLowerCase() !== "true") return;
+
+  const me = await twitter.currentUserV2();
+  const userId = me.data.id;
+
+  console.log("🤝 Auto-engage worker ON");
+  let sinceId: string | undefined = undefined;
+
+  while (true) {
+    try {
+      const st = getState();
+      if (st.dryRun) { await sleep(10_000); continue; }
+
+      const res: any = await twitter.v2.userMentionTimeline(userId, {
+        since_id: sinceId,
+        "tweet.fields": ["created_at","public_metrics","text","author_id"],
+        expansions: ["author_id"],
+        max_results: 50
+      });
+
+      const tweets: any[] = res.data?.data ?? [];
+      if (tweets.length) sinceId = tweets[0].id;
+
+      for (const t of tweets.reverse()) {
+        const text = (t.text || "").toLowerCase();
+        if (/#(nsfw|adult|scam)/.test(text) || /(http:|https:)/.test(text)) continue;
+
+        try { await twitter.v2.like(userId, t.id); } catch {}
+
+        // Simple heuristic reply: if question mark present, craft a short reply
+        if (/\?/.test(text)) {
+          try {
+            const replyText = "Thanks for the mention! 🙌"; // you can LLM this with your persona if desired
+            await twitter.v2.tweet({ text: replyText, reply: { in_reply_to_tweet_id: t.id } });
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.error("auto-engage error:", e);
+    }
+    await sleep(15000);
+  }
+}
